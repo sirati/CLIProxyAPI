@@ -176,6 +176,12 @@ routing:
   #     errors (429, 401/402/403, 404/model support, invalid_grant) rebind as normal.
   # Ignored when routing.session-affinity is false.
   session-affinity-rebind-on: "any"
+  # When true, Claude requests go to the credential whose weekly quota window resets
+  # soonest (read from the anthropic-ratelimit-unified-7d-* headers), within the highest
+  # available priority tier, so quota that would expire unused is spent first.
+  # Credentials without a running weekly window, and other providers, use `strategy`.
+  # With session-affinity, this decides where new sessions bind.
+  claude-weekly-reset-first: false
 
   # When true, unprefixed model requests only use credentials without a prefix (except when prefix == model name).
   force-model-prefix: false

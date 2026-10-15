@@ -75,3 +75,24 @@ func TestApplyManagerConfigStopsReplacedServiceAffinitySelector(t *testing.T) {
 		t.Fatal("expected replaced selector to be stopped during routing config apply")
 	}
 }
+
+func TestClaudeWeeklyResetFirstRoutingSelectorSitsInsideAffinity(t *testing.T) {
+	state := normalizedRoutingRuntimeState(&internalconfig.Config{
+		Routing: internalconfig.RoutingConfig{Strategy: "wrr", SessionAffinity: true, ClaudeWeeklyResetFirst: true},
+	})
+	selector := newRoutingSelector(state)
+	affinity, ok := selector.(*coreauth.SessionAffinitySelector)
+	if !ok {
+		t.Fatalf("selector type = %T, want *auth.SessionAffinitySelector", selector)
+	}
+	defer affinity.Stop()
+
+	state.sessionAffinity = false
+	weekly, ok := newRoutingSelector(state).(*coreauth.ClaudeWeeklyResetFirstSelector)
+	if !ok {
+		t.Fatalf("selector type = %T, want *auth.ClaudeWeeklyResetFirstSelector", newRoutingSelector(state))
+	}
+	if _, ok := weekly.Fallback.(*coreauth.WeightedRoundRobinSelector); !ok {
+		t.Fatalf("fallback type = %T, want *auth.WeightedRoundRobinSelector", weekly.Fallback)
+	}
+}

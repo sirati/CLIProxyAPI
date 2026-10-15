@@ -666,7 +666,9 @@ func selectionArgForSelector(selector Selector, routeModel string) string {
 func selectorContextForAvailableAuths(ctx context.Context, selector Selector, routeModel string) context.Context {
 	ctx = withWeightedSelectorStateModel(ctx, selector, routeModel)
 	if !isBuiltInSelector(selector) {
-		if _, sessionAffinity := selector.(*SessionAffinitySelector); !sessionAffinity {
+		switch selector.(type) {
+		case *SessionAffinitySelector, *ClaudeWeeklyResetFirstSelector:
+		default:
 			return ctx
 		}
 	}
@@ -681,7 +683,7 @@ func (m *Manager) transientlyUnavailableSessionAffinityAuthIDs(selector Selector
 	if !ok || affinity == nil || !affinity.rebindOnQuotaOnly || len(affinityCandidates) == 0 {
 		return nil
 	}
-	if _, weighted := affinity.fallback.(*WeightedRoundRobinSelector); weighted {
+	if selectorUsesWeights(affinity.fallback) {
 		affinityCandidates = positiveWeightAuths(affinityCandidates)
 	}
 	var authIDs map[string]struct{}

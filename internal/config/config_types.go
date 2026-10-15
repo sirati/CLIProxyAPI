@@ -403,6 +403,12 @@ type RoutingConfig struct {
 	//     auth errors (429, 401/402/403, 404/model support, invalid_grant) rebind as normal.
 	// Ignored when SessionAffinity is false.
 	SessionAffinityRebindOn string `yaml:"session-affinity-rebind-on,omitempty" json:"session-affinity-rebind-on,omitempty"`
+
+	// ClaudeWeeklyResetFirst sends Claude requests to the credential whose weekly quota
+	// window resets soonest, within the highest available priority tier. Credentials
+	// without a running weekly window, and non-Claude credentials, use Strategy.
+	// With session affinity, it decides where new sessions bind.
+	ClaudeWeeklyResetFirst bool `yaml:"claude-weekly-reset-first,omitempty" json:"claude-weekly-reset-first,omitempty"`
 }
 
 // OAuthModelAlias defines a model ID alias for a specific channel.
