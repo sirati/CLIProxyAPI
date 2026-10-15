@@ -890,3 +890,41 @@ api-keys:
 		t.Fatalf("unexpected loaded headers: %+v", loaded.OpenAICompatibility[0].Headers)
 	}
 }
+
+func TestConfigV8ClaudeWeeklyResetFirstField(t *testing.T) {
+	file := filepath.Join(t.TempDir(), "config.yaml")
+	if err := os.WriteFile(file, []byte("config-version: 8\nrouting: {strategy: weighted-round-robin}\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := config.LoadConfig(file)
+	if err != nil {
+		t.Fatal(err)
+	}
+	h := &Handler{cfg: cfg, configFilePath: file}
+	router := gin.New()
+	router.PUT("/v8/management/config/*path", h.ConfigV8)
+	router.GET("/v8/management/config/*path", h.ConfigV8)
+	const url = "/v8/management/config/routing/claude-weekly-reset-first"
+
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, httptest.NewRequest(http.MethodPut, url, strings.NewReader("true")))
+	if w.Code != http.StatusOK {
+		t.Fatalf("put: status=%d body=%s", w.Code, w.Body.String())
+	}
+	saved, err := config.LoadConfig(file)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !saved.Routing.ClaudeWeeklyResetFirst || saved.Routing.Strategy != "weighted-round-robin" {
+		t.Fatalf("saved routing = %+v, want claude-weekly-reset-first on and strategy kept", saved.Routing)
+	}
+	if !h.cfg.Routing.ClaudeWeeklyResetFirst {
+		t.Fatal("runtime config not updated")
+	}
+
+	w = httptest.NewRecorder()
+	router.ServeHTTP(w, httptest.NewRequest(http.MethodGet, url, nil))
+	if w.Code != http.StatusOK || !strings.Contains(w.Body.String(), "true") {
+		t.Fatalf("get: status=%d body=%s", w.Code, w.Body.String())
+	}
+}
