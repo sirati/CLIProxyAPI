@@ -407,6 +407,8 @@ type RoutingConfig struct {
 	// ClaudeWeeklyResetFirst sends Claude requests to the credential whose weekly quota
 	// window resets soonest, within the highest available priority tier. Credentials
 	// without a running weekly window, and non-Claude credentials, use Strategy.
+	// Non-Fable requests avoid a credential whose weekly share left is within 5 points of
+	// half its Fable weekly share left, so that quota stays usable for Fable.
 	// With session affinity, it decides where new sessions bind.
 	ClaudeWeeklyResetFirst bool `yaml:"claude-weekly-reset-first,omitempty" json:"claude-weekly-reset-first,omitempty"`
 }

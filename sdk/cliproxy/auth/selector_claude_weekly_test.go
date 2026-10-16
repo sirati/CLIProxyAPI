@@ -211,3 +211,67 @@ func TestManagerSelectAuth_ClaudeWeeklyResetFirstFromObservedHeaders(t *testing.
 		t.Fatalf("SelectAuth() = %q, want claude-soon", selected.ID)
 	}
 }
+
+func claudeFableSignals(weeklyReset time.Time, weeklyUsed, fableUsed string) map[string]string {
+	signals := claudeWeeklySignals(weeklyReset)
+	signals["Anthropic-Ratelimit-Unified-7d-Utilization"] = weeklyUsed
+	signals["Anthropic-Ratelimit-Unified-7d_oi-Status"] = "allowed"
+	signals["Anthropic-Ratelimit-Unified-7d_oi-Utilization"] = fableUsed
+	signals["Anthropic-Ratelimit-Unified-7d_oi-Reset"] = strconv.FormatInt(weeklyReset.Unix(), 10)
+	return signals
+}
+
+func TestClaudeWeeklyResetFirst_KeepsFableReserveForFable(t *testing.T) {
+	t.Parallel()
+	now := time.Now()
+	// a: weekly 40% left, Fable 80% left -> reserve 40%, so a is held for Fable.
+	reservedSoon := claudeWeeklyAuth("a", claudeFableSignals(now.Add(10*time.Hour), "0.6", "0.2"))
+	// b: weekly 70% left, Fable 80% left -> 30 points above the reserve.
+	free := claudeWeeklyAuth("b", claudeFableSignals(now.Add(5*24*time.Hour), "0.3", "0.2"))
+
+	if got := pickClaudeWeekly(t, "claude-opus-5-5", reservedSoon, free); got != "b" {
+		t.Fatalf("opus picked %q, want b (a's weekly quota is kept for Fable)", got)
+	}
+	if got := pickClaudeWeekly(t, "claude-fable-5-1", reservedSoon, free); got != "a" {
+		t.Fatalf("fable picked %q, want a (soonest reset; the reserve is for Fable)", got)
+	}
+}
+
+func TestClaudeWeeklyResetFirst_FableReserveMargin(t *testing.T) {
+	t.Parallel()
+	now := time.Now()
+	// Weekly 46% left, reserve 40%: 6 points away, outside the 5-point margin.
+	outside := claudeWeeklyAuth("a", claudeFableSignals(now.Add(10*time.Hour), "0.54", "0.2"))
+	later := claudeWeeklyAuth("b", claudeWeeklySignals(now.Add(5*24*time.Hour)))
+	if got := pickClaudeWeekly(t, "claude-opus-5-5", outside, later); got != "a" {
+		t.Fatalf("picked %q, want a (not yet within the reserve margin)", got)
+	}
+	// Weekly 44% left: 4 points away, inside the margin.
+	inside := claudeWeeklyAuth("a", claudeFableSignals(now.Add(10*time.Hour), "0.56", "0.2"))
+	if got := pickClaudeWeekly(t, "claude-opus-5-5", inside, later); got != "b" {
+		t.Fatalf("picked %q, want b (a is within the reserve margin)", got)
+	}
+}
+
+func TestClaudeWeeklyResetFirst_ReservedAfterUnobserved(t *testing.T) {
+	t.Parallel()
+	now := time.Now()
+	reserved := claudeWeeklyAuth("a", claudeFableSignals(now.Add(10*time.Hour), "0.9", "0.2"))
+	if got := pickClaudeWeekly(t, "claude-opus-5-5", reserved, claudeWeeklyAuth("z", nil)); got != "z" {
+		t.Fatalf("picked %q, want z (credentials without a Fable reserve go first)", got)
+	}
+	if got := pickClaudeWeekly(t, "claude-opus-5-5", reserved); got != "a" {
+		t.Fatalf("picked %q, want a (reserved credentials still serve when nothing else is left)", got)
+	}
+}
+
+func TestClaudeWeeklyResetFirst_SpentFableWindowReservesNothing(t *testing.T) {
+	t.Parallel()
+	now := time.Now()
+	// Fable fully used: reserve 0, weekly 20% left stays usable for others.
+	spent := claudeWeeklyAuth("a", claudeFableSignals(now.Add(10*time.Hour), "0.8", "1"))
+	later := claudeWeeklyAuth("b", claudeWeeklySignals(now.Add(5*24*time.Hour)))
+	if got := pickClaudeWeekly(t, "claude-opus-5-5", spent, later); got != "a" {
+		t.Fatalf("picked %q, want a (no Fable quota left to protect)", got)
+	}
+}

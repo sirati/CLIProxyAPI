@@ -180,6 +180,8 @@ routing:
   # soonest (read from the anthropic-ratelimit-unified-7d-* headers), within the highest
   # available priority tier, so quota that would expire unused is spent first.
   # Credentials without a running weekly window, and other providers, use `strategy`.
+  # For non-Fable models, a credential whose weekly share left comes within 5 points of half
+  # its Fable weekly share left is kept for Fable and used only after all others.
   # With session-affinity, this decides where new sessions bind.
   claude-weekly-reset-first: false
 

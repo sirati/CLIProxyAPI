@@ -53,7 +53,8 @@ func (s *ClaudeWeeklyResetFirstSelector) Pick(ctx context.Context, provider, mod
 		return nil, err
 	}
 
-	var ranked, open []*Auth
+	fable := isClaudeFableModel(model)
+	var ranked, reserved, open []*Auth
 	resets := make(map[string]time.Time, len(available))
 	for _, auth := range available {
 		signals := claudeUnifiedSignals(auth)
@@ -70,9 +71,18 @@ func (s *ClaudeWeeklyResetFirstSelector) Pick(ctx context.Context, provider, mod
 			continue
 		}
 		resets[auth.ID] = resetAt
+		if !fable && claudeWeeklyReservedForFable(signals, now) {
+			reserved = append(reserved, auth)
+			continue
+		}
 		ranked = append(ranked, auth)
 	}
 
+	// Order: unreserved running windows by reset, then credentials without a
+	// running window (through Fallback), then Fable-reserved ones by reset.
+	if len(ranked) == 0 && len(open) == 0 {
+		ranked = reserved
+	}
 	if len(ranked) > 0 {
 		sort.Slice(ranked, func(i, j int) bool {
 			ri, rj := resets[ranked[i].ID], resets[ranked[j].ID]
@@ -91,6 +101,54 @@ func (s *ClaudeWeeklyResetFirstSelector) Pick(ctx context.Context, provider, mod
 		open = available
 	}
 	return fallback.Pick(ctx, provider, model, opts, open)
+}
+
+// claudeFableReserveMargin is how close (as a share of the weekly window) the
+// weekly share left may come to half the Fable share left before non-Fable
+// requests stop using the credential.
+const claudeFableReserveMargin = 0.05
+
+// claudeWeeklyReservedForFable reports whether the credential's weekly window
+// should be kept for Fable: half of its Fable weekly share left is reserved,
+// and the weekly share left is within claudeFableReserveMargin of that reserve.
+// Fable traffic also counts toward the weekly window, so spending the weekly
+// window on other models below this point would strand the Fable quota.
+// A credential that never reported a Fable window has nothing to reserve.
+func claudeWeeklyReservedForFable(signals map[string]string, now time.Time) bool {
+	fableLeft, ok := claudeWindowShareLeft(signals, "7d_oi", now)
+	if !ok {
+		return false
+	}
+	weeklyLeft, ok := claudeWindowShareLeft(signals, "7d", now)
+	if !ok {
+		return false
+	}
+	return weeklyLeft <= fableLeft/2+claudeFableReserveMargin
+}
+
+// claudeWindowShareLeft returns the share (0-1) of the named window still
+// left. A window whose reset has passed is full again.
+func claudeWindowShareLeft(signals map[string]string, window string, now time.Time) (float64, bool) {
+	raw, hasUtilization := signals[window+"-utilization"]
+	_, hasReset := signals[window+"-reset"]
+	if !hasUtilization && !hasReset {
+		return 0, false
+	}
+	if _, running := claudeWindowReset(signals, window, now); hasReset && !running {
+		return 1, true
+	}
+	if strings.EqualFold(signals[window+"-status"], "rejected") {
+		return 0, true
+	}
+	used, errParse := strconv.ParseFloat(raw, 64)
+	if errParse != nil {
+		return 0, false
+	}
+	return min(max(1-used, 0), 1), true
+}
+
+func isClaudeFableModel(model string) bool {
+	return strings.Contains(strings.ToLower(model), "fable")
 }
 
 // claudeUnifiedSignals returns the credential's last observed Claude unified
@@ -130,7 +188,7 @@ func claudeWindowReset(signals map[string]string, window string, now time.Time) 
 // window (7d_oi) only applies to Fable models.
 func claudeWindowsRejected(signals map[string]string, model string, now time.Time) bool {
 	windows := []string{"5h", "7d"}
-	if strings.Contains(strings.ToLower(model), "fable") {
+	if isClaudeFableModel(model) {
 		windows = append(windows, "7d_oi")
 	}
 	for _, window := range windows {
