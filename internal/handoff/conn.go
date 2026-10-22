@@ -57,6 +57,7 @@ type Conn struct {
 	reading      bool
 	userDeadline time.Time
 	detachReq    bool
+	holding      bool // detachReq is provisional (Hold); Release can undo it
 	rerun        bool // detach mid-request because the new process re-runs it
 	detached     bool
 	detachedCh   chan struct{}
@@ -124,6 +125,11 @@ func (c *Conn) Read(p []byte) (int, error) {
 			return 0, io.EOF
 		}
 		if c.detachReq && c.detachableLocked() {
+			if c.holding {
+				// Held for a handoff that may still be called off.
+				c.cond.Wait()
+				continue
+			}
 			c.finishDetachLocked()
 			return 0, io.EOF
 		}
@@ -246,9 +252,60 @@ func (c *Conn) finishDetachLocked() {
 // a unit is in progress; the caller retries at the next idle point. On true,
 // Detached is closed once the reader has been released.
 func (c *Conn) TryDetach() bool {
+	return c.Hold() && c.Commit()
+}
+
+// Hold stops delivering at the current boundary without giving the Conn away
+// yet, so a handoff that needs several Conns can take all or none: Commit
+// finishes the detach, Release resumes normal operation. A websocket Conn is
+// only held while its reader is blocked waiting for the next frame, which
+// proves no message is half way between the socket and its consumer.
+func (c *Conn) Hold() bool {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	return c.tryDetachLocked(false)
+	if c.detached || c.closed || c.detachReq {
+		return c.detached
+	}
+	if !c.detachableLocked() {
+		return false
+	}
+	if (c.mode == ModeWSServer || c.mode == ModeWSClient) && !c.reading {
+		return false
+	}
+	c.detachReq = true
+	c.holding = true
+	if c.reading {
+		_ = c.raw.SetReadDeadline(time.Unix(1, 0))
+	}
+	return true
+}
+
+// Release ends a Hold and lets the reader continue.
+func (c *Conn) Release() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if !c.holding {
+		return
+	}
+	c.holding = false
+	c.detachReq = false
+	_ = c.raw.SetReadDeadline(c.userDeadline)
+	c.cond.Broadcast()
+}
+
+// Commit turns a Hold into a detach. It reports whether the Conn is detached.
+func (c *Conn) Commit() bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.detached {
+		return true
+	}
+	if !c.holding {
+		return false
+	}
+	c.holding = false
+	c.finishDetachLocked()
+	return true
 }
 
 // TryDetachForRerun detaches an HTTP connection in the middle of a request that
@@ -266,7 +323,7 @@ func (c *Conn) tryDetachLocked(rerun bool) bool {
 	if c.detached {
 		return true
 	}
-	if c.closed {
+	if c.closed || c.detachReq {
 		return false
 	}
 	c.rerun = rerun
@@ -276,11 +333,10 @@ func (c *Conn) tryDetachLocked(rerun bool) bool {
 	}
 	c.detachReq = true
 	if c.reading {
-		// Wake the blocked read; it sees detachReq and stops.
+		// Wake the blocked read; it sees the detach and returns io.EOF.
 		_ = c.raw.SetReadDeadline(time.Unix(1, 0))
-	} else {
-		c.finishDetachLocked()
 	}
+	c.finishDetachLocked()
 	return true
 }
 
@@ -330,6 +386,9 @@ func (c *Conn) HandshakeResponse() []byte {
 // Write implements net.Conn.
 func (c *Conn) Write(p []byte) (int, error) {
 	c.mu.Lock()
+	for c.holding {
+		c.cond.Wait()
+	}
 	if c.detached || c.detachReq {
 		c.mu.Unlock()
 		return 0, ErrDetached

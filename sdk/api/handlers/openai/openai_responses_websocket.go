@@ -337,7 +337,7 @@ func (h *OpenAIResponsesAPIHandler) ResponsesWebsocket(c *gin.Context) {
 		return
 	}
 	writer := newResponsesWebsocketWriter(conn)
-	passthroughSessionID := uuid.NewString()
+	passthroughSessionID := responsesWebsocketSessionID(c, uuid.NewString())
 	socketCtx, cancelSocket := context.WithCancelCause(c.Request.Context())
 	defer cancelSocket(nil)
 	c.Request = c.Request.WithContext(socketCtx)
@@ -484,11 +484,19 @@ func (h *OpenAIResponsesAPIHandler) ResponsesWebsocket(c *gin.Context) {
 		}
 		pinnedAuthID = ""
 	}
+	input, parkHandoff := h.bindResponsesWebsocketHandoff(c, input, duplexInput != nil, &responsesWebsocketHandoffVars{
+		SessionID: &passthroughSessionID, SessionKey: &downstreamSessionKey, LastRequest: &lastRequest,
+		LastResponseOutput: &lastResponseOutput, ObservedCompaction: &observedCompaction, LastResponseID: &lastResponseID,
+		PendingPrewarmID: &pendingPrewarmID, LastResponsePendingToolCallIDs: &lastResponsePendingToolCallIDs,
+		PinnedAuthID: &pinnedAuthID, PinnedAuthByProvider: pinnedAuthByProvider, PassthroughModelName: &passthroughModelName,
+		UpstreamMode: &upstreamMode, UpstreamWebsocketAuthID: &upstreamWebsocketAuthID,
+	})
 
 	for {
 		var msgType int
 		var payload []byte
 		var errReadMessage error
+		parkHandoff()
 		select {
 		case message, ok := <-input:
 			if !ok {
