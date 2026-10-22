@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"os"
 	"sync"
@@ -227,13 +228,17 @@ func (s *Service) startHandoff(ctx context.Context) {
 			s.applyHandoffEvent(ctx, event)
 		}
 		h.earlyEvents = nil
+		// systemd must follow this process before the old one may exit:
+		// once the old main process ends, systemd would otherwise stop the
+		// whole unit.
+		if errNotify := handoff.Notify(fmt.Sprintf("MAINPID=%d\nREADY=1", os.Getpid())); errNotify != nil {
+			log.Warnf("handoff: notify systemd: %v", errNotify)
+		} else if errBarrier := handoff.NotifyBarrier(30 * time.Second); errBarrier != nil {
+			log.Warnf("handoff: notify systemd: %v", errBarrier)
+		}
 		if errReady := h.ctrl.Send(sdkhandoff.Message{Type: sdkhandoff.TypeReady}); errReady != nil {
 			s.reportTakeover(fmt.Errorf("handoff: ready: %w", errReady))
 			return
-		}
-		// systemd follows the new process from here on.
-		if errNotify := handoff.Notify(fmt.Sprintf("MAINPID=%d\nREADY=1", os.Getpid())); errNotify != nil {
-			log.Warnf("handoff: notify systemd: %v", errNotify)
 		}
 		log.Info("handoff: serving; the previous process is draining")
 		s.reportTakeover(nil)
@@ -374,6 +379,11 @@ func (s *Service) serveTakeover(ctx context.Context, conn *sdkhandoff.Conn, cont
 	}
 	msg, files, errRecv := conn.Recv()
 	closeFiles(files)
+	if errors.Is(errRecv, io.EOF) {
+		// A liveness check (-upgrade dials before starting the new binary).
+		_ = conn.Close()
+		return false
+	}
 	var peer sdkhandoff.Hello
 	if errRecv != nil || msg.Type != sdkhandoff.TypeHello || msg.Decode(&peer) != nil {
 		return fail(errors.New("expected a hello"))

@@ -5,6 +5,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -24,7 +25,13 @@ import (
 const (
 	handoffStatusFDEnv = "CLIPROXY_HANDOFF_STATUS_FD"
 	upgradeTimeout     = 3 * time.Minute
+	// exitNoService tells the caller nothing could be taken over (the running
+	// service predates handoff support or is not running); the systemd unit
+	// falls back to a restart then.
+	exitNoService = 3
 )
+
+var errNoService = errors.New("no service that supports handoff is running")
 
 var (
 	handoffSocket string
@@ -52,7 +59,12 @@ func defaultHandoffSocket() string {
 // applyHandoffFlags runs right after flag.Parse.
 func applyHandoffFlags() {
 	if upgradeFlag {
-		if errUpgrade := runUpgrade(); errUpgrade != nil {
+		errUpgrade := runUpgrade()
+		if errors.Is(errUpgrade, errNoService) {
+			fmt.Fprintln(os.Stderr, "upgrade:", errUpgrade)
+			os.Exit(exitNoService)
+		}
+		if errUpgrade != nil {
 			fmt.Fprintln(os.Stderr, "upgrade failed:", errUpgrade)
 			os.Exit(1)
 		}
@@ -85,9 +97,11 @@ func runUpgrade() error {
 	if handoffSocket == "" {
 		return errors.New("no handoff socket: set -handoff-socket or run under systemd with RuntimeDirectory")
 	}
-	if _, errStat := os.Stat(handoffSocket); errStat != nil {
-		return fmt.Errorf("no running service at %s: %w", handoffSocket, errStat)
+	probe, errDial := net.Dial("unix", handoffSocket)
+	if errDial != nil {
+		return fmt.Errorf("%w at %s: %v", errNoService, handoffSocket, errDial)
 	}
+	_ = probe.Close()
 	exe, errExe := os.Executable()
 	if errExe != nil {
 		return errExe
