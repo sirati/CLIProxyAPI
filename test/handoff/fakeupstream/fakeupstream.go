@@ -1,11 +1,13 @@
-package handoff_test
+// Package fakeupstream holds fake Claude and Codex upstreams for the handoff
+// tests. The proxy reaches them through ordinary api-keys entries with a
+// base-url, so every request takes the production path.
+package fakeupstream
 
 import (
 	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
-	"net/http/httptest"
 	"strconv"
 	"strings"
 	"sync"
@@ -15,30 +17,28 @@ import (
 	"github.com/gorilla/websocket"
 )
 
-// fakeClaude is an Anthropic Messages upstream. A request whose text holds
+// Claude is an Anthropic Messages upstream. A request whose text holds
 // "stream:N" sends N deltas 100ms apart. "fail-first" makes the first key
 // that sees it wait and answer 429, so the proxy has to choose another
 // credential; that key keeps failing such requests.
-type fakeClaude struct {
-	server   *httptest.Server
+type Claude struct {
 	requests atomic.Int64
 	mu       sync.Mutex
-	failKey  string // the key that got the first "fail-first" request
+	failKey  string
 }
 
-func (f *fakeClaude) failedKey() string {
+// FailedKey returns the key that got the first "fail-first" request.
+func (f *Claude) FailedKey() string {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return f.failKey
 }
 
-func newFakeClaude() *fakeClaude {
-	f := &fakeClaude{}
-	f.server = httptest.NewServer(http.HandlerFunc(f.serve))
-	return f
-}
+// Requests counts the requests served.
+func (f *Claude) Requests() int64 { return f.requests.Load() }
 
-func (f *fakeClaude) serve(w http.ResponseWriter, r *http.Request) {
+// ServeHTTP implements http.Handler.
+func (f *Claude) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	f.requests.Add(1)
 	body, _ := io.ReadAll(r.Body)
 	text := string(body)
@@ -90,23 +90,27 @@ func (f *fakeClaude) serve(w http.ResponseWriter, r *http.Request) {
 	send("message_stop", `{"type":"message_stop"}`)
 }
 
-// fakeCodex is a Responses websocket upstream over TLS. Like the real one it
-// only knows previous_response_id values from the same connection; every
-// reply names the connection, so a test sees whether it changed.
-type fakeCodex struct {
-	server      *httptest.Server
+// Codex is a Responses websocket upstream. Like the real one it only knows
+// previous_response_id values from the same connection; every reply names
+// the connection ("conn=N turn=M"), so a client sees whether it changed.
+type Codex struct {
 	connections atomic.Int64
 	mu          sync.Mutex
 	errors      []string
 }
 
-func newFakeCodex() *fakeCodex {
-	f := &fakeCodex{}
-	f.server = httptest.NewTLSServer(http.HandlerFunc(f.serve))
-	return f
+// Connections counts the websocket connections accepted.
+func (f *Codex) Connections() int64 { return f.connections.Load() }
+
+// ProtocolErrors lists the continuity violations seen.
+func (f *Codex) ProtocolErrors() []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]string(nil), f.errors...)
 }
 
-func (f *fakeCodex) serve(w http.ResponseWriter, r *http.Request) {
+// ServeHTTP implements http.Handler.
+func (f *Codex) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	upgrader := websocket.Upgrader{EnableCompression: true}
 	conn, errUpgrade := upgrader.Upgrade(w, r, nil)
 	if errUpgrade != nil {
@@ -122,10 +126,7 @@ func (f *fakeCodex) serve(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		var request map[string]any
-		if json.Unmarshal(payload, &request) != nil {
-			continue
-		}
-		if request["type"] != "response.create" {
+		if json.Unmarshal(payload, &request) != nil || request["type"] != "response.create" {
 			continue
 		}
 		if previous, _ := request["previous_response_id"].(string); previous != "" && previous != lastID {
@@ -154,10 +155,4 @@ func (f *fakeCodex) serve(w http.ResponseWriter, r *http.Request) {
 		_ = conn.WriteJSON(map[string]any{"type": "response.completed", "sequence_number": 4, "response": response("completed", []any{item})})
 		lastID = id
 	}
-}
-
-func (f *fakeCodex) protocolErrors() []string {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	return append([]string(nil), f.errors...)
 }

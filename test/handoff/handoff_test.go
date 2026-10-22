@@ -3,14 +3,11 @@
 package handoff_test
 
 import (
-	"context"
-	"encoding/json"
 	"encoding/pem"
 	"fmt"
-	"io"
 	"net"
 	"net/http"
-	"net/http/httptrace"
+	"net/http/httptest"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -21,7 +18,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/gorilla/websocket"
+	"github.com/router-for-me/CLIProxyAPI/v8/test/handoff/fakeupstream"
+	"github.com/router-for-me/CLIProxyAPI/v8/test/handoff/workload"
 )
 
 var proxyBinary string
@@ -64,12 +62,12 @@ func freePort(t *testing.T) int {
 	return l.Addr().(*net.TCPAddr).Port
 }
 
-func newProxyEnv(t *testing.T, claude *fakeClaude, codex *fakeCodex) *proxyEnv {
+func newProxyEnv(t *testing.T, f *fakes) *proxyEnv {
 	t.Helper()
 	dir := t.TempDir()
 	env := &proxyEnv{t: t, dir: dir, config: filepath.Join(dir, "config.yaml"), socket: filepath.Join(dir, "handoff.sock"), port: freePort(t)}
 	ca := filepath.Join(dir, "ca.pem")
-	certPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: codex.server.Certificate().Raw})
+	certPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: f.codexServer.Certificate().Raw})
 	if err := os.WriteFile(ca, certPEM, 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -101,7 +99,7 @@ api-keys:
       keys:
         - api-key: "codex-key"
           websockets: true
-`, env.port, filepath.Join(dir, "auth"), claude.server.URL, codex.server.URL+"/codex")
+`, env.port, filepath.Join(dir, "auth"), f.claudeServer.URL, f.codexServer.URL+"/codex")
 	if err := os.WriteFile(env.config, []byte(config), 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -243,96 +241,55 @@ func (e *proxyEnv) dumpLogs() {
 
 func (e *proxyEnv) url(path string) string { return fmt.Sprintf("http://127.0.0.1:%d%s", e.port, path) }
 
-// claudeStream posts a streaming Messages request and returns the body.
+const clientKey = "client-key"
+
 func claudeStream(client *http.Client, url, text string) (string, bool, error) {
-	body := fmt.Sprintf(`{"model":"claude-fake","max_tokens":16,"stream":true,"messages":[{"role":"user","content":%q}]}`, text)
-	reused := false
-	trace := &httptrace.ClientTrace{GotConn: func(info httptrace.GotConnInfo) { reused = info.Reused }}
-	req, _ := http.NewRequestWithContext(httptrace.WithClientTrace(context.Background(), trace), http.MethodPost, url, strings.NewReader(body))
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("X-Api-Key", "client-key")
-	req.Header.Set("Anthropic-Version", "2023-06-01")
-	resp, err := client.Do(req)
-	if err != nil {
-		return "", reused, err
-	}
-	defer func() { _ = resp.Body.Close() }()
-	data, err := io.ReadAll(resp.Body)
-	if resp.StatusCode != http.StatusOK {
-		return string(data), reused, fmt.Errorf("status %d: %s", resp.StatusCode, data)
-	}
-	return string(data), reused, err
+	return workload.ClaudeStream(client, url, clientKey, text)
 }
 
-type codexClient struct {
-	conn *websocket.Conn
-	last string
-}
-
-func dialCodex(t *testing.T, e *proxyEnv) *codexClient {
+func dialCodex(t *testing.T, e *proxyEnv) *workload.CodexSession {
 	t.Helper()
-	header := http.Header{}
-	header.Set("Authorization", "Bearer client-key")
-	conn, _, err := websocket.DefaultDialer.Dial(strings.Replace(e.url("/v1/responses"), "http", "ws", 1), header)
+	session, err := workload.DialCodex(strings.Replace(e.url("/v1/responses"), "http", "ws", 1), clientKey)
 	if err != nil {
 		t.Fatal(err)
 	}
-	return &codexClient{conn: conn}
+	return session
 }
 
-// turn sends one response.create and returns the completed response's text.
-func (c *codexClient) turn(t *testing.T, text string) string {
+func turn(t *testing.T, session *workload.CodexSession, text string) string {
 	t.Helper()
-	request := map[string]any{
-		"type": "response.create", "model": "gpt-fake",
-		"input": []any{map[string]any{"type": "message", "role": "user",
-			"content": []any{map[string]any{"type": "input_text", "text": text}}}},
-	}
-	if c.last != "" {
-		request["previous_response_id"] = c.last
-	}
-	if err := c.conn.WriteJSON(request); err != nil {
+	got, err := session.Turn(text)
+	if err != nil {
 		t.Fatal(err)
 	}
-	_ = c.conn.SetReadDeadline(time.Now().Add(20 * time.Second))
-	for {
-		_, payload, err := c.conn.ReadMessage()
-		if err != nil {
-			t.Fatalf("websocket read: %v", err)
-		}
-		var event struct {
-			Type     string `json:"type"`
-			Response struct {
-				ID     string `json:"id"`
-				Output []struct {
-					Content []struct {
-						Text string `json:"text"`
-					} `json:"content"`
-				} `json:"output"`
-			} `json:"response"`
-		}
-		_ = json.Unmarshal(payload, &event)
-		switch event.Type {
-		case "response.completed":
-			c.last = event.Response.ID
-			if len(event.Response.Output) > 0 && len(event.Response.Output[0].Content) > 0 {
-				return event.Response.Output[0].Content[0].Text
-			}
-			return ""
-		case "error", "response.failed":
-			t.Fatalf("websocket turn failed: %s", payload)
-		}
-	}
+	return got
+}
+
+// fakes are the upstreams, served the way the proxy reaches real ones.
+type fakes struct {
+	claude       *fakeupstream.Claude
+	codex        *fakeupstream.Codex
+	claudeServer *httptest.Server
+	codexServer  *httptest.Server
+}
+
+func newFakes(t *testing.T) *fakes {
+	f := &fakes{claude: &fakeupstream.Claude{}, codex: &fakeupstream.Codex{}}
+	f.claudeServer = httptest.NewServer(f.claude)
+	f.codexServer = httptest.NewTLSServer(f.codex)
+	t.Cleanup(func() {
+		f.claudeServer.Close()
+		f.codexServer.Close()
+	})
+	return f
 }
 
 func TestUpgradeKeepsEveryConnection(t *testing.T) {
 	if testing.Short() {
 		t.Skip("runs real proxy processes")
 	}
-	claude, codex := newFakeClaude(), newFakeCodex()
-	defer claude.server.Close()
-	defer codex.server.Close()
-	env := newProxyEnv(t, claude, codex)
+	f := newFakes(t)
+	env := newProxyEnv(t, f)
 	first := env.start()
 	messages := env.url("/v1/messages")
 
@@ -343,7 +300,7 @@ func TestUpgradeKeepsEveryConnection(t *testing.T) {
 	}
 	// A Codex session with one turn done.
 	codexSession := dialCodex(t, env)
-	if got := codexSession.turn(t, "one"); got != "conn=1 turn=1" {
+	if got := turn(t, codexSession, "one"); got != "conn=1 turn=1" {
 		t.Fatalf("turn 1: %q", got)
 	}
 
@@ -374,7 +331,7 @@ func TestUpgradeKeepsEveryConnection(t *testing.T) {
 		t.Fatalf("the stream running during the upgrade broke: %v\n%s", stream.err, stream.body)
 	}
 	rerun := <-rerunDone
-	failed := claude.failedKey()
+	failed := f.claude.FailedKey()
 	if rerun.err != nil || failed == "" || strings.Contains(rerun.body, "|"+failed+"]") || !strings.Contains(rerun.body, "message_stop") {
 		t.Fatalf("the request that needed a decision after the cut: %v\n%s", rerun.err, rerun.body)
 	}
@@ -382,7 +339,7 @@ func TestUpgradeKeepsEveryConnection(t *testing.T) {
 	if err != nil || !reused || !strings.Contains(body, "message_stop") {
 		t.Fatalf("keep-alive connection after the upgrade: reused=%v err=%v %q", reused, err, body)
 	}
-	if got := codexSession.turn(t, "two"); got != "conn=1 turn=2" {
+	if got := turn(t, codexSession, "two"); got != "conn=1 turn=2" {
 		t.Fatalf("turn 2 after the upgrade: %q (want the same upstream connection)", got)
 	}
 	if !alive(first) {
@@ -391,7 +348,7 @@ func TestUpgradeKeepsEveryConnection(t *testing.T) {
 
 	// A second upgrade: the middle process passes the stream on and leaves.
 	third := env.upgrade()
-	if got := codexSession.turn(t, "three"); got != "conn=1 turn=3" {
+	if got := turn(t, codexSession, "three"); got != "conn=1 turn=3" {
 		t.Fatalf("turn 3 after the second upgrade: %q", got)
 	}
 	env.waitExit(second, 20*time.Second)
@@ -400,12 +357,12 @@ func TestUpgradeKeepsEveryConnection(t *testing.T) {
 	}
 
 	// Closing the session ends the relay, and with it the first process.
-	_ = codexSession.conn.Close()
+	_ = codexSession.Close()
 	env.waitExit(first, 20*time.Second)
-	if errs := codex.protocolErrors(); len(errs) > 0 {
+	if errs := f.codex.ProtocolErrors(); len(errs) > 0 {
 		t.Fatalf("upstream saw broken continuity: %v", errs)
 	}
-	if n := codex.connections.Load(); n != 1 {
+	if n := f.codex.Connections(); n != 1 {
 		t.Fatalf("upstream saw %d websocket connections, want 1", n)
 	}
 
@@ -419,10 +376,8 @@ func TestFailedTakeoverLeavesTheServiceRunning(t *testing.T) {
 	if testing.Short() {
 		t.Skip("runs real proxy processes")
 	}
-	claude, codex := newFakeClaude(), newFakeCodex()
-	defer claude.server.Close()
-	defer codex.server.Close()
-	env := newProxyEnv(t, claude, codex)
+	f := newFakes(t)
+	env := newProxyEnv(t, f)
 	first := env.start()
 	messages := env.url("/v1/messages")
 	keepAlive := &http.Client{Transport: &http.Transport{MaxConnsPerHost: 1}}
