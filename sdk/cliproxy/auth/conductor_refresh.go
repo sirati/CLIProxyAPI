@@ -906,6 +906,9 @@ func (m *Manager) markRejectedAccessToken(id, failedAccessToken string) {
 }
 
 func (m *Manager) refreshAuthForRequestAtEpoch(ctx context.Context, id, failedAccessToken string, registrationEpoch uint64) (*Auth, error) {
+	if errFrozen := handoffFrozen(ctx); errFrozen != nil {
+		return nil, errFrozen
+	}
 	if m == nil {
 		return nil, errors.New("auth manager is nil")
 	}

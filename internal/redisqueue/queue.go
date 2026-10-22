@@ -69,6 +69,9 @@ func Enqueue(payload []byte) {
 	if len(payload) == 0 {
 		return
 	}
+	if forwardForHandoff(payload, false) {
+		return
+	}
 	if global.publishToSubscribers(payload) {
 		return
 	}
@@ -80,6 +83,9 @@ func EnqueueError(payload []byte) {
 		return
 	}
 	if len(payload) == 0 {
+		return
+	}
+	if forwardForHandoff(payload, true) {
 		return
 	}
 	errorGlobal.publishToSubscribers(payload)

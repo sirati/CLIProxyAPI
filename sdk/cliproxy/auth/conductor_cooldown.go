@@ -875,6 +875,9 @@ func isStaleExecutionResult(result Result, current *Auth) bool {
 
 // MarkResult records an execution result and notifies hooks.
 func (m *Manager) MarkResult(ctx context.Context, result Result) {
+	if forwardHandoffResult(result) {
+		return
+	}
 	if result.AuthID == "" {
 		return
 	}
