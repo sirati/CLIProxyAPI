@@ -3,13 +3,31 @@
 {
   lib,
   buildGoModule,
+  go,
+  fetchurl,
   versionCheckHook,
   # Passed from the flake so the version tracks the checked-out commit.
   src,
   rev ? "dirty",
 }:
 
-buildGoModule (finalAttrs: {
+let
+  # go.mod requires a newer Go than nixpkgs may ship yet; build that release
+  # until nixpkgs catches up, then this falls back to nixpkgs' go.
+  minGo = "1.26.10";
+  goForModule =
+    if lib.versionAtLeast go.version minGo then
+      go
+    else
+      go.overrideAttrs {
+        version = minGo;
+        src = fetchurl {
+          url = "https://go.dev/dl/go${minGo}.src.tar.gz";
+          hash = "sha256:fd63e883ba2f2bfca93c1646b31ebef63e2b1e4d2b317c9789d976a68d81f36f";
+        };
+      };
+in
+(buildGoModule.override { go = goForModule; }) (finalAttrs: {
   __structuredAttrs = true;
 
   pname = "cliproxyapi";
@@ -17,7 +35,7 @@ buildGoModule (finalAttrs: {
 
   inherit src;
 
-  vendorHash = "sha256-r3yWkdMcM40G9jV7MxW/qNv3E9WrHavFilW24quEf+8=";
+  vendorHash = "sha256-yMO0DdE0pjtFxWaQXV17enV8u0KA5fIUbE8Gui/RvWU=";
 
   subPackages = [ "cmd/server" ];
 
