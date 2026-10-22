@@ -6,8 +6,6 @@ import (
 	"os"
 	"sync"
 	"sync/atomic"
-
-	log "github.com/sirupsen/logrus"
 )
 
 // ErrFrozen is returned to code in the old process that would make a
@@ -21,6 +19,8 @@ type Sink interface {
 	Send(kind, id string, payload any, files ...*os.File) error
 	// Event reports a side effect the new process applies.
 	Event(kind string, payload any)
+	// Supports reports whether the new process takes an item kind.
+	Supports(kind string) bool
 }
 
 var (
@@ -37,6 +37,14 @@ func Freeze(s Sink) {
 	sinkMu.Unlock()
 	frozen.Store(true)
 	notifyFrozen()
+}
+
+// Unfreeze undoes Freeze when the new process failed before taking over.
+func Unfreeze() {
+	frozen.Store(false)
+	sinkMu.Lock()
+	sink = nil
+	sinkMu.Unlock()
 }
 
 // Frozen reports whether this process has handed off.
@@ -221,10 +229,4 @@ func Capabilities() []string {
 		out = append(out, kind)
 	}
 	return out
-}
-
-func logSendError(kind string, err error) {
-	if err != nil {
-		log.Warnf("handoff: sending %s failed: %v", kind, err)
-	}
 }

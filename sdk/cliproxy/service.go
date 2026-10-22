@@ -29,6 +29,9 @@ type Service struct {
 	// cfg holds the current application configuration.
 	cfg *config.Config
 
+	// handoff hands the running service to a newer binary.
+	handoff serviceHandoff
+
 	// cfgMu protects concurrent access to the configuration.
 	cfgMu sync.RWMutex
 

@@ -60,6 +60,7 @@ func StartServiceWithPluginHost(cfg *config.Config, configPath string, localPass
 		log.Errorf("failed to build proxy service: %v", err)
 		return
 	}
+	service.EnableHandoff(handoffConfig)
 
 	err = service.Run(runCtx)
 	if err != nil && !errors.Is(err, context.Canceled) {

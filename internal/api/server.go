@@ -51,6 +51,9 @@ type Server struct {
 	// muxHTTPListener receives HTTP connections selected by the multiplexer.
 	muxHTTPListener *muxListener
 
+	// handoff moves the listener and connections to a newer binary.
+	handoff serverHandoff
+
 	// handlers contains the API handlers for processing requests.
 	handlers         *handlers.BaseAPIHandler
 	codexLiveHandler *codexlive.Handler
@@ -172,6 +175,7 @@ func NewServer(cfg *config.Config, authManager *auth.Manager, accessManager *sdk
 	engine.Use(logging.GinLogrusLogger())
 	engine.Use(logging.GinLogrusRecovery())
 	engine.Use(logging.CPATraceIDMiddleware())
+	engine.Use(s.handoffRerunMiddleware())
 	engine.Use(s.maxRequestBodyBytesMiddleware())
 	for _, mw := range optionState.extraMiddleware {
 		engine.Use(mw)
@@ -265,6 +269,7 @@ func NewServer(cfg *config.Config, authManager *auth.Manager, accessManager *sdk
 		Addr:    fmt.Sprintf("%s:%d", cfg.Host, cfg.Port),
 		Handler: engine,
 	}
+	s.configureHandoff()
 
 	return s
 }
@@ -297,7 +302,7 @@ func (s *Server) Start() error {
 	}
 
 	addr := s.server.Addr
-	listener, errListen := net.Listen("tcp", addr)
+	listener, errListen := s.listen(addr)
 	if errListen != nil {
 		return fmt.Errorf("failed to start HTTP server: %v", errListen)
 	}

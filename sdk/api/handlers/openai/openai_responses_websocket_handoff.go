@@ -263,6 +263,11 @@ func (s *responsesWebsocketHandoffSession) forward(ctx context.Context) {
 
 // TryHandoff implements handoff.Session.
 func (s *responsesWebsocketHandoffSession) TryHandoff() bool {
+	sink := handoff.CurrentSink()
+	if sink == nil || !sink.Supports(sdkhandoff.KindConnWSResponses) {
+		// The new process cannot take sessions; this one stays until it ends.
+		return false
+	}
 	s.mu.Lock()
 	if s.gone {
 		s.mu.Unlock()
@@ -300,6 +305,10 @@ func (s *responsesWebsocketHandoffSession) TryHandoff() bool {
 		return false
 	}
 	upstream, upstreamState, hasUpstream := handoff.ExportUpstream(*s.vars.SessionID)
+	if hasUpstream && !sink.Supports(sdkhandoff.KindRelayPlain) {
+		s.client.Release()
+		return false
+	}
 	if hasUpstream && !upstream.Hold() {
 		s.client.Release()
 		return false
@@ -350,11 +359,6 @@ func (s *responsesWebsocketHandoffSession) TryHandoff() bool {
 			item.UpstreamCarry = upstreamCarry
 			files = append(files, upstreamFile)
 		}
-	}
-	sink := handoff.CurrentSink()
-	if sink == nil {
-		log.Errorf("handoff: responses websocket %s: no new process to send to", item.SessionID)
-		return true
 	}
 	if errSend := sink.Send(sdkhandoff.KindConnWSResponses, item.SessionID, item, files...); errSend != nil {
 		log.Errorf("handoff: responses websocket %s: %v", item.SessionID, errSend)

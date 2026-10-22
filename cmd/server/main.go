@@ -199,8 +199,10 @@ func main() {
 		}
 	}
 
+	registerHandoffFlags()
 	// Parse the command-line flags.
 	flag.Parse()
+	applyHandoffFlags()
 
 	if discoverGateways || discoverJSON {
 		cfgInclude, cfgExclude := cmd.LoadDiscoveryScanFilters(configPath)

@@ -32,15 +32,25 @@ func handoffFrozen(ctx context.Context) error {
 }
 
 // FreezeForHandoff stops every background owner and every write. Requests
-// already running keep their in-memory state and finish.
-func (m *Manager) FreezeForHandoff() {
+// already running keep their in-memory state and finish. The returned thaw
+// undoes it if the new process fails before taking over.
+func (m *Manager) FreezeForHandoff() (thaw func(ctx context.Context, refreshInterval time.Duration)) {
 	if m == nil {
-		return
+		return func(context.Context, time.Duration) {}
 	}
+	m.mu.RLock()
+	store, cooldownStore := m.store, m.cooldownStore
+	m.mu.RUnlock()
 	m.StopAutoRefresh()
 	m.StopUsageGuard()
 	m.SetStore(nil)
 	m.SetCooldownStateStore(nil)
+	return func(ctx context.Context, refreshInterval time.Duration) {
+		m.SetStore(store)
+		m.SetCooldownStateStore(cooldownStore)
+		m.StartAutoRefresh(ctx, refreshInterval)
+		m.StartUsageGuard(ctx)
+	}
 }
 
 // handoffResult is the serialisable part of a Result.

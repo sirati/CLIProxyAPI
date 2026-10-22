@@ -83,6 +83,11 @@ func (s *Service) Run(ctx context.Context) error {
 	s.applyRetryConfig(cfg)
 	s.configureCooldownStateStore(cfg)
 
+	if errTakeover := s.beginHandoffTakeover(); errTakeover != nil {
+		s.reportTakeover(errTakeover)
+		return errTakeover
+	}
+
 	s.registerPluginAuthParser()
 	if s.coreManager != nil && !homeEnabled {
 		if errLoad := s.coreManager.Load(ctx); errLoad != nil {
@@ -94,6 +99,7 @@ func (s *Service) Run(ctx context.Context) error {
 				log.Warnf("failed to restore cooldown state: %v", errRestoreCooldown)
 			}
 		}
+		s.importHandoffAuthState(ctx)
 		s.registerAvailableExecutors(ctx, executorRegistrationOptions{
 			includeBaseline: true,
 			auths:           s.coreManager.List(),
@@ -135,6 +141,7 @@ func (s *Service) Run(ctx context.Context) error {
 
 	// handlers no longer depend on legacy clients; pass nil slice initially
 	s.server = api.NewServer(cfg, s.coreManager, s.accessManager, s.configPath, s.serverOptions...)
+	s.attachHandoffServer()
 	s.syncPluginRuntimeConfig(ctx)
 	if homeEnabled {
 		s.configRuntimeMu.Lock()
@@ -187,6 +194,7 @@ func (s *Service) Run(ctx context.Context) error {
 	if currentCfg := s.currentConfig(); currentCfg != nil {
 		fmt.Printf("API server started successfully on: %s:%d\n", currentCfg.Host, currentCfg.Port)
 	}
+	s.startHandoff(ctx)
 
 	s.configRuntimeMu.Lock()
 	currentCfg := s.currentConfig()
