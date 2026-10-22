@@ -108,6 +108,8 @@ func AdoptClientWebsocket(ctx context.Context, file *os.File, carry, response101
 	}
 	inner := NewConn(raw, ModeWSClient, carry)
 	inner.httpIdle = false
+	// The next process replays the same handshake.
+	inner.handshakeResponse = append([]byte(nil), response101...)
 	local := &handshakeAnswerConn{Conn: inner, response: response101}
 	dialer := websocket.Dialer{
 		NetDialContext:    func(context.Context, string, string) (net.Conn, error) { return local, nil },

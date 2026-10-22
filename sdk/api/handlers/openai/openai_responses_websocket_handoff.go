@@ -97,6 +97,9 @@ type responsesWebsocketHandoffItem struct {
 	ClientCarry   []byte                               `json:"client_carry,omitempty"`
 	Upstream      *handoff.UpstreamState               `json:"upstream,omitempty"`
 	UpstreamCarry []byte                               `json:"upstream_carry,omitempty"`
+	// Replay holds client messages the old process received after it froze;
+	// the new process handles them first.
+	Replay [][]byte `json:"replay,omitempty"`
 }
 
 type responsesWebsocketSeedKey struct{}
@@ -143,7 +146,11 @@ func (h *OpenAIResponsesAPIHandler) bindResponsesWebsocketHandoff(c *gin.Context
 		wake:     make(chan struct{}, 1),
 	}
 	session.cond = sync.NewCond(&session.mu)
-	go session.forward(ctx)
+	var replay [][]byte
+	if seed := responsesWebsocketSeed(ctx); seed != nil {
+		replay = seed.Replay
+	}
+	go session.forward(ctx, replay)
 	session.unregister = handoff.RegisterSession(session)
 	go func() {
 		<-ctx.Done()
@@ -215,10 +222,11 @@ type responsesWebsocketHandoffSession struct {
 
 	mu        sync.Mutex
 	cond      *sync.Cond
-	idle      bool // the loop is waiting for a message
-	quiesce   bool // the controller asked the forwarder to pause
-	quiescent bool // the forwarder is paused holding nothing
-	gone      bool // handed off
+	idle      bool     // the loop is waiting for a message
+	quiesce   bool     // the controller asked the forwarder to pause
+	quiescent bool     // the forwarder is paused holding nothing
+	gone      bool     // handed off
+	replay    [][]byte // messages held back because this process froze
 }
 
 // park runs in the handler loop right before it waits. The mutex orders the
@@ -230,8 +238,18 @@ func (s *responsesWebsocketHandoffSession) park() {
 	s.mu.Unlock()
 }
 
-func (s *responsesWebsocketHandoffSession) forward(ctx context.Context) {
+func (s *responsesWebsocketHandoffSession) forward(ctx context.Context, replay [][]byte) {
 	defer close(s.out)
+	for _, payload := range replay {
+		s.mu.Lock()
+		s.idle = false
+		s.mu.Unlock()
+		select {
+		case s.out <- cliproxyexecutor.WebsocketInput{Payload: payload}:
+		case <-ctx.Done():
+			return
+		}
+	}
 	for {
 		s.mu.Lock()
 		for s.quiesce {
@@ -247,6 +265,12 @@ func (s *responsesWebsocketHandoffSession) forward(ctx context.Context) {
 				return
 			}
 			s.mu.Lock()
+			if message.Err == nil && handoffTakesSessions() {
+				// This process froze: a new turn belongs to the new process.
+				s.replay = append(s.replay, message.Payload)
+				s.mu.Unlock()
+				continue
+			}
 			s.idle = false
 			s.mu.Unlock()
 			select {
@@ -294,6 +318,7 @@ func (s *responsesWebsocketHandoffSession) TryHandoff() bool {
 		s.mu.Lock()
 	}
 	ready := s.quiescent && s.idle && len(s.original) == 0
+	replay := append([][]byte(nil), s.replay...)
 	s.mu.Unlock()
 	if !ready {
 		return false
@@ -332,6 +357,7 @@ func (s *responsesWebsocketHandoffSession) TryHandoff() bool {
 		SessionKey: *s.vars.SessionKey,
 		State:      s.vars.snapshot(),
 	}
+	item.Replay = replay
 	item.ToolOutputs = exportWebsocketToolCache(defaultWebsocketToolOutputCache, item.SessionKey)
 	item.ToolCalls = exportWebsocketToolCache(defaultWebsocketToolCallCache, item.SessionKey)
 
@@ -449,4 +475,14 @@ func importWebsocketToolCache(cache *websocketToolOutputCache, sessionKey string
 	for _, entry := range entries {
 		cache.record(sessionKey, entry.CallID, entry.Item)
 	}
+}
+
+// handoffTakesSessions reports whether this process froze and its successor
+// takes Responses sessions with their upstream.
+func handoffTakesSessions() bool {
+	if !handoff.Frozen() {
+		return false
+	}
+	sink := handoff.CurrentSink()
+	return sink != nil && sink.Supports(sdkhandoff.KindConnWSResponses) && sink.Supports(sdkhandoff.KindRelayPlain)
 }

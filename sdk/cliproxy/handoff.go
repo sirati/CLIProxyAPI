@@ -218,6 +218,11 @@ func (s *Service) startHandoff(ctx context.Context) {
 		return
 	}
 	if h.ctrl != nil {
+		if errFault := handoffFault("before-ready"); errFault != nil {
+			s.reportTakeover(errFault)
+			_ = h.ctrl.Close()
+			os.Exit(1)
+		}
 		for _, event := range h.earlyEvents {
 			s.applyHandoffEvent(ctx, event)
 		}

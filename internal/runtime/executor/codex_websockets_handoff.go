@@ -35,7 +35,7 @@ func exportCodexUpstream(sessionID string) (*handoff.Conn, handoff.UpstreamState
 	if sess.conn == nil {
 		return nil, handoff.UpstreamState{}, false
 	}
-	inner, ok := sess.conn.NetConn().(*handoff.Conn)
+	inner, ok := handoff.Unwrap(sess.conn.NetConn())
 	if !ok {
 		return nil, handoff.UpstreamState{}, false
 	}

@@ -111,11 +111,26 @@ func WithRequestMarker(ctx context.Context) (context.Context, *RequestMarker) {
 // HitFrozen reports whether the request ran into ErrFrozen.
 func (m *RequestMarker) HitFrozen() bool { return m != nil && m.hit.Load() }
 
+// MarkerGinKey is where the API middleware also keeps the marker: handlers
+// run executions on a fresh context that only carries the gin context.
+const MarkerGinKey = "handoff.marker"
+
 // NoteFrozen marks the request in ctx and returns ErrFrozen.
 func NoteFrozen(ctx context.Context) error {
-	if ctx != nil {
-		if marker, ok := ctx.Value(markerKey{}).(*RequestMarker); ok {
-			marker.hit.Store(true)
+	if ctx == nil {
+		return ErrFrozen
+	}
+	if marker, ok := ctx.Value(markerKey{}).(*RequestMarker); ok {
+		marker.hit.Store(true)
+	}
+	type keyGetter interface {
+		Get(key string) (any, bool)
+	}
+	if gc, ok := ctx.Value("gin").(keyGetter); ok {
+		if value, exists := gc.Get(MarkerGinKey); exists {
+			if marker, ok := value.(*RequestMarker); ok {
+				marker.hit.Store(true)
+			}
 		}
 	}
 	return ErrFrozen

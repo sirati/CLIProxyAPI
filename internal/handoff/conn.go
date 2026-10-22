@@ -518,3 +518,15 @@ func ConnContext(ctx context.Context, conn net.Conn) context.Context {
 	}
 	return ctx
 }
+
+// HandoffConn returns the Conn itself; wrappers that embed a Conn inherit it,
+// so code holding a net.Conn can find the Conn underneath.
+func (c *Conn) HandoffConn() *Conn { return c }
+
+// Unwrap finds the Conn beneath conn, if there is one.
+func Unwrap(conn net.Conn) (*Conn, bool) {
+	if inner, ok := conn.(interface{ HandoffConn() *Conn }); ok {
+		return inner.HandoffConn(), true
+	}
+	return nil, false
+}

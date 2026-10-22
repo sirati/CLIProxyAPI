@@ -243,16 +243,16 @@ func (s *Server) HandoffIdleConns() int {
 	s.handoff.mu.Unlock()
 	sink := handoff.CurrentSink()
 	movable := sink != nil && sink.Supports(sdkhandoff.KindConnHTTP1)
-	remaining := 0
 	for _, conn := range conns {
-		if movable && conn.Mode() == handoff.ModeHTTPServer && conn.TryDetach() {
-			continue
-		}
-		if !conn.IsDetached() {
-			remaining++
+		if movable && conn.Mode() == handoff.ModeHTTPServer {
+			conn.TryDetach()
 		}
 	}
-	return remaining
+	// A detached Conn stays tracked until it was sent, so the caller does
+	// not close the control connection under a send.
+	s.handoff.mu.Lock()
+	defer s.handoff.mu.Unlock()
+	return len(s.handoff.conns)
 }
 
 // configureHandoff installs the connection hooks on the http.Server.
@@ -278,6 +278,7 @@ func (s *Server) handoffRerunMiddleware() gin.HandlerFunc {
 		}
 		ctx, marker := handoff.WithRequestMarker(c.Request.Context())
 		c.Request = c.Request.WithContext(ctx)
+		c.Set(handoff.MarkerGinKey, marker)
 		writer := &handoffRerunWriter{ResponseWriter: c.Writer, marker: marker}
 		c.Writer = writer
 		c.Next()
