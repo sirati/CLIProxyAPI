@@ -184,8 +184,9 @@ routing:
   # its Fable weekly share left is kept for Fable and used only after all others.
   # With session-affinity, this decides where new sessions bind.
   claude-weekly-reset-first: false
-  # Per Claude credential (auth file fields, e.g. via PATCH /auth-files/fields), checked
-  # every 5 minutes against GET /api/oauth/usage:
+  # Per Claude or Codex credential (auth file fields, e.g. via PATCH /auth-files/fields),
+  # checked every 5 minutes against the provider usage endpoint (Claude GET /api/oauth/usage,
+  # Codex GET chatgpt.com/backend-api/wham/usage; Codex team plans use their monthly window):
   #   min_remaining: 20   keep 20% of the weekly window unused; below it the credential
   #                       is held (a credential quota cooldown) until a check finds it above.
   #   use_once: true      disable the credential for good, keeping its login, once its weekly

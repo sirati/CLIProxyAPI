@@ -19,7 +19,7 @@ import (
 // Credential metadata keys read by the usage guard. Both are set per auth file,
 // for example through PATCH /auth-files/fields.
 const (
-	// MetadataMinRemaining is the share of the Claude weekly window, in percent,
+	// MetadataMinRemaining is the share of the weekly window, in percent,
 	// that must stay unused. Below it the credential is not used until a later
 	// check finds it above again.
 	MetadataMinRemaining = "min_remaining"
@@ -41,7 +41,16 @@ const (
 	useOnceMaxWeeklyIncrease = 5.0
 
 	claudeUsageURL = "https://api.anthropic.com/api/oauth/usage"
+	codexUsageURL  = "https://chatgpt.com/backend-api/wham/usage"
+
+	codexUsageUserAgent = "codex-tui/0.154.0 (Mac OS 26.5.2; arm64) iTerm.app/3.6.11 (codex-tui; 0.154.0)"
+	codexWeekSeconds    = 7 * 24 * 60 * 60
+	codexMinMonthSecs   = 28 * 24 * 60 * 60
+	codexMaxMonthSecs   = 31 * 24 * 60 * 60
 )
+
+// usageGuardProviders are the providers whose weekly usage the guard can read.
+var usageGuardProviders = map[string]bool{"claude": true, "codex": true}
 
 type usageGuardSettings struct {
 	minRemaining    float64
@@ -55,7 +64,7 @@ type usageGuardSettings struct {
 
 func usageGuardSettingsOf(auth *Auth) (usageGuardSettings, bool) {
 	var settings usageGuardSettings
-	if auth == nil || !strings.EqualFold(strings.TrimSpace(auth.Provider), "claude") || len(auth.Metadata) == 0 {
+	if auth == nil || !usageGuardProviders[strings.ToLower(strings.TrimSpace(auth.Provider))] || len(auth.Metadata) == 0 {
 		return settings, false
 	}
 	settings.minRemaining, settings.hasMinRemaining = metadataNumber(auth.Metadata[MetadataMinRemaining])
@@ -135,6 +144,54 @@ func parseClaudeWeeklyUsage(body []byte) (float64, error) {
 	return min(max(used.Float(), 0), 100), nil
 }
 
+// parseCodexWeeklyUsage reads used_percent of the weekly window from a Codex
+// GET /wham/usage body. Windows are told apart by limit_window_seconds, as the
+// panel's Quota page does; team plans have a monthly window instead, which
+// counts as the long window here. Without durations the secondary window is
+// the long one.
+func parseCodexWeeklyUsage(body []byte) (float64, error) {
+	if !gjson.ValidBytes(body) {
+		return 0, fmt.Errorf("usage body is not JSON")
+	}
+	rateLimit := firstGJSON(gjson.ParseBytes(body), "rate_limit", "rateLimit")
+	if !rateLimit.IsObject() {
+		return 0, fmt.Errorf("usage body has no rate_limit")
+	}
+	var weekly gjson.Result
+	for _, keys := range [][]string{{"primary_window", "primaryWindow"}, {"secondary_window", "secondaryWindow"}} {
+		window := firstGJSON(rateLimit, keys...)
+		seconds := firstGJSON(window, "limit_window_seconds", "limitWindowSeconds").Int()
+		if seconds == codexWeekSeconds || (seconds >= codexMinMonthSecs && seconds <= codexMaxMonthSecs) {
+			weekly = window
+			break
+		}
+	}
+	if !weekly.Exists() {
+		weekly = firstGJSON(rateLimit, "secondary_window", "secondaryWindow")
+		if firstGJSON(weekly, "limit_window_seconds", "limitWindowSeconds").Exists() {
+			// Durations are given and none is a week or a month.
+			weekly = gjson.Result{}
+		}
+	}
+	if !weekly.IsObject() {
+		return 0, fmt.Errorf("usage body has no weekly window")
+	}
+	used := firstGJSON(weekly, "used_percent", "usedPercent")
+	if used.Type != gjson.Number {
+		return 0, fmt.Errorf("usage body has no weekly used_percent")
+	}
+	return min(max(used.Float(), 0), 100), nil
+}
+
+func firstGJSON(object gjson.Result, paths ...string) gjson.Result {
+	for _, path := range paths {
+		if value := object.Get(path); value.Exists() {
+			return value
+		}
+	}
+	return gjson.Result{}
+}
+
 type usageGuard struct {
 	cancel context.CancelFunc
 
@@ -144,7 +201,7 @@ type usageGuard struct {
 	holds map[string]time.Time
 }
 
-// StartUsageGuard polls the Claude usage endpoint every five minutes for each
+// StartUsageGuard polls the provider's usage endpoint every five minutes for each
 // credential with use_once or min_remaining set, and holds or retires it.
 func (m *Manager) StartUsageGuard(parent context.Context) {
 	if m == nil {
@@ -211,7 +268,7 @@ func (m *Manager) checkUsageGuards(ctx context.Context, guard *usageGuard) {
 }
 
 func (m *Manager) checkUsageGuard(ctx context.Context, guard *usageGuard, auth *Auth, settings usageGuardSettings) {
-	weeklyUsed, errFetch := m.fetchClaudeWeeklyUsage(ctx, auth)
+	weeklyUsed, errFetch := m.fetchWeeklyUsage(ctx, auth)
 	if errFetch != nil {
 		log.Warnf("usage guard: %s: %v", auth.ID, errFetch)
 		// Unknown usage must not lift a hold: keep it until a check succeeds.
@@ -243,17 +300,33 @@ func (m *Manager) checkUsageGuard(ctx context.Context, guard *usageGuard, auth *
 	}
 }
 
-func (m *Manager) fetchClaudeWeeklyUsage(ctx context.Context, auth *Auth) (float64, error) {
+// fetchWeeklyUsage asks the credential's provider for its weekly usage in
+// percent. The request goes through the provider executor, which adds the
+// credential's token.
+func (m *Manager) fetchWeeklyUsage(ctx context.Context, auth *Auth) (float64, error) {
 	reqCtx, cancel := context.WithTimeout(ctx, usageGuardFetchTimeout)
 	defer cancel()
-	req, errReq := http.NewRequestWithContext(reqCtx, http.MethodGet, claudeUsageURL, nil)
+	isCodex := strings.EqualFold(strings.TrimSpace(auth.Provider), "codex")
+	usageURL, parse := claudeUsageURL, parseClaudeWeeklyUsage
+	if isCodex {
+		usageURL, parse = codexUsageURL, parseCodexWeeklyUsage
+	}
+	req, errReq := http.NewRequestWithContext(reqCtx, http.MethodGet, usageURL, nil)
 	if errReq != nil {
 		return 0, errReq
 	}
 	req.Header.Set("Accept", "application/json")
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Anthropic-Beta", "oauth-2025-04-20")
-	req.Header.Set("User-Agent", "claude-cli/2.1.280 (external, cli)")
+	if isCodex {
+		req.Header.Set("User-Agent", codexUsageUserAgent)
+		req.Header.Set("Originator", "codex-tui")
+		if accountID, ok := auth.Metadata["account_id"].(string); ok && strings.TrimSpace(accountID) != "" {
+			req.Header.Set("Chatgpt-Account-Id", accountID)
+		}
+	} else {
+		req.Header.Set("Anthropic-Beta", "oauth-2025-04-20")
+		req.Header.Set("User-Agent", "claude-cli/2.1.280 (external, cli)")
+	}
 	resp, errDo := m.HttpRequest(reqCtx, auth, req)
 	if errDo != nil {
 		return 0, errDo
@@ -266,7 +339,7 @@ func (m *Manager) fetchClaudeWeeklyUsage(ctx context.Context, auth *Auth) (float
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		return 0, fmt.Errorf("usage endpoint returned HTTP %d", resp.StatusCode)
 	}
-	return parseClaudeWeeklyUsage(body)
+	return parse(body)
 }
 
 func (m *Manager) applyUsageHold(ctx context.Context, guard *usageGuard, authID, reason string) {
