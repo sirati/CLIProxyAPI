@@ -6,6 +6,7 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"regexp"
 	"strings"
 	"testing"
 	"time"
@@ -263,27 +264,50 @@ func TestWriteClaudeErrorResponseUsesClaudeEnvelope(t *testing.T) {
 	}
 }
 
-func TestWriteClaudeErrorResponse_IncludesRetryAfterForModelCooldownDefaultSettings(t *testing.T) {
+// t3CodeGatewayLimit is how T3 Code reads a gateway's wrapped 429 from Claude
+// Code's result text; a match is what makes it resume the thread on time.
+var t3CodeGatewayLimit = regexp.MustCompile(`^API Error: 503 \[[^\]\r\n]+\] \[429\]: \{"type":"error","error":\{"type":"rate_limit_error",[^\r\n]*\} \(reset after (?:(\d+)h ?)?(?:(\d+)m ?)?(?:(\d+)s)?\)`)
+
+func TestWriteClaudeErrorResponse_ModelCooldownCarriesReset(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	recorder := httptest.NewRecorder()
 	c, _ := gin.CreateTestContext(recorder)
 	handler := &ClaudeCodeAPIHandler{}
 
-	cooldownErr := coreauth.NewManager(nil, nil, nil)
-	_ = cooldownErr
-	// Create mock model cooldown error
 	msg := &interfaces.ErrorMessage{
 		StatusCode: http.StatusTooManyRequests,
-		Error:      coreauth.NewModelCooldownError("claude-sonnet-4-6", "claude", 20*time.Second),
+		Error:      coreauth.NewModelCooldownError("claude-sonnet-4-6", "claude", 2*time.Hour+30*time.Minute+5*time.Second),
 	}
 
 	handler.WriteErrorResponse(c, msg)
 
-	if recorder.Code != http.StatusTooManyRequests {
-		t.Fatalf("status = %d, want %d", recorder.Code, http.StatusTooManyRequests)
+	if recorder.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want %d", recorder.Code, http.StatusServiceUnavailable)
 	}
-	if got := recorder.Header().Get("Retry-After"); got != "20" {
-		t.Fatalf("Retry-After = %q, want 20", got)
+	if got := recorder.Header().Get("x-should-retry"); got != "false" {
+		t.Fatalf("x-should-retry = %q, want false", got)
+	}
+	if got := recorder.Header().Get("Retry-After"); got != "9005" {
+		t.Fatalf("Retry-After = %q, want 9005", got)
+	}
+	// Claude Code prints "API Error: <status> <error.message>" for such a body.
+	result := "API Error: 503 " + gjson.GetBytes(recorder.Body.Bytes(), "error.message").String()
+	match := t3CodeGatewayLimit.FindStringSubmatch(result)
+	if match == nil || match[1] != "2" || match[2] != "30" || match[3] != "5" {
+		t.Fatalf("result %q does not carry the reset as T3 Code reads it: %v", result, match)
+	}
+}
+
+func TestWriteClaudeErrorResponse_OtherErrorsKeepTheirStatus(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	recorder := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(recorder)
+	handler := &ClaudeCodeAPIHandler{}
+
+	handler.WriteErrorResponse(c, &interfaces.ErrorMessage{StatusCode: http.StatusBadGateway, Error: errors.New("upstream broke")})
+
+	if recorder.Code != http.StatusBadGateway || recorder.Header().Get("x-should-retry") != "" {
+		t.Fatalf("status = %d, x-should-retry = %q", recorder.Code, recorder.Header().Get("x-should-retry"))
 	}
 }
 
