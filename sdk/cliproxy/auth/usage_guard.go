@@ -25,10 +25,11 @@ const (
 	MetadataMinRemaining = "min_remaining"
 	// MetadataUseOnce retires the credential for good (disabled, login kept)
 	// once its weekly window is empty or below MetadataMinRemaining, or once
-	// weekly usage has risen more than useOnceMaxWeeklyIncrease points.
+	// the window resets: weekly usage falls more than useOnceResetDrop points
+	// below the highest usage seen. It drains one window's quota, then stops.
 	MetadataUseOnce = "use_once"
 
-	// metadataUseOnceBaseline is the lowest weekly usage, in percent, seen
+	// metadataUseOnceBaseline is the highest weekly usage, in percent, seen
 	// since use_once was set. It is kept in the auth file across restarts.
 	metadataUseOnceBaseline = "use_once_baseline"
 	// metadataUseOnceRetired records why and when a use_once credential retired.
@@ -36,9 +37,9 @@ const (
 )
 
 const (
-	usageGuardInterval       = 5 * time.Minute
-	usageGuardFetchTimeout   = 30 * time.Second
-	useOnceMaxWeeklyIncrease = 5.0
+	usageGuardInterval     = 5 * time.Minute
+	usageGuardFetchTimeout = 30 * time.Second
+	useOnceResetDrop       = 5.0
 
 	claudeUsageURL = "https://api.anthropic.com/api/oauth/usage"
 	codexUsageURL  = "https://chatgpt.com/backend-api/wham/usage"
@@ -112,8 +113,8 @@ func decideUsageGuard(settings usageGuardSettings, weeklyUsed float64) usageGuar
 	}
 
 	baseline := settings.baseline
-	if !settings.hasBaseline || weeklyUsed < baseline {
-		// First reading, or the weekly window reset since: measure from here.
+	if !settings.hasBaseline || weeklyUsed > baseline {
+		// First reading, or more used: a reset is measured from the peak.
 		baseline = weeklyUsed
 		decision.baseline, decision.setBaseline = baseline, true
 	}
@@ -124,9 +125,9 @@ func decideUsageGuard(settings usageGuardSettings, weeklyUsed float64) usageGuar
 	case belowMinimum:
 		decision.action = usageGuardRetire
 		decision.reason = fmt.Sprintf("weekly remaining %.1f%% is below the minimum %.1f%%", remaining, settings.minRemaining)
-	case weeklyUsed-baseline > useOnceMaxWeeklyIncrease:
+	case baseline-weeklyUsed > useOnceResetDrop:
 		decision.action = usageGuardRetire
-		decision.reason = fmt.Sprintf("weekly usage rose from %.1f%% to %.1f%%", baseline, weeklyUsed)
+		decision.reason = fmt.Sprintf("weekly window reset: usage fell from %.1f%% to %.1f%%", baseline, weeklyUsed)
 	}
 	return decision
 }

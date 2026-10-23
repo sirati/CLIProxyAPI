@@ -34,11 +34,13 @@ func TestDecideUsageGuard(t *testing.T) {
 		{"min: at threshold", minimum(20), 80, usageGuardAllow, 0, false},
 		{"min: below", minimum(20), 80.5, usageGuardHold, 0, false},
 		{"once: first reading sets baseline", usageGuardSettings{useOnce: true}, 30, usageGuardAllow, 30, true},
-		{"once: within 5 points", useOnce(30), 35, usageGuardAllow, 0, false},
-		{"once: more than 5 points", useOnce(30), 35.1, usageGuardRetire, 0, false},
-		{"once: empty", useOnce(99), 100, usageGuardRetire, 0, false},
-		{"once: window reset lowers baseline", useOnce(60), 4, usageGuardAllow, 4, true},
-		{"once: below minimum retires", usageGuardSettings{useOnce: true, baseline: 85, hasBaseline: true, minRemaining: 12, hasMinRemaining: true}, 89, usageGuardRetire, 0, false},
+		{"once: usage rising raises baseline", useOnce(30), 60, usageGuardAllow, 60, true},
+		{"once: unchanged", useOnce(30), 30, usageGuardAllow, 0, false},
+		{"once: dip within 5 points", useOnce(30), 25, usageGuardAllow, 0, false},
+		{"once: drop over 5 points is a reset", useOnce(30), 24.9, usageGuardRetire, 0, false},
+		{"once: empty", useOnce(99), 100, usageGuardRetire, 100, true},
+		{"once: window reset retires", useOnce(60), 4, usageGuardRetire, 0, false},
+		{"once: below minimum retires", usageGuardSettings{useOnce: true, baseline: 85, hasBaseline: true, minRemaining: 12, hasMinRemaining: true}, 89, usageGuardRetire, 89, true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			got := decideUsageGuard(tc.settings, tc.used)
@@ -237,7 +239,7 @@ func TestUsageGuard_MinRemainingHoldsAndReleases(t *testing.T) {
 	}
 }
 
-func TestUsageGuard_UseOnceRetiresAfterFivePoints(t *testing.T) {
+func TestUsageGuard_UseOnceRetiresOnWindowReset(t *testing.T) {
 	for _, provider := range []string{"claude", "codex"} {
 		t.Run(provider, func(t *testing.T) {
 			model := "usage-guard-once-model-" + provider
@@ -253,13 +255,20 @@ func TestUsageGuard_UseOnceRetiresAfterFivePoints(t *testing.T) {
 				t.Fatalf("baseline = %v, want 40", auth.Metadata[metadataUseOnceBaseline])
 			}
 
-			executor.set(a, 44)
+			// Using the credential is the point: rising usage never retires it.
+			executor.set(a, 70)
 			manager.checkUsageGuards(ctx, guard)
 			if got := selectUsageGuarded(t, manager, provider, model); got != a {
-				t.Fatalf("selected %q, want %s (4 points is within the limit)", got, a)
+				t.Fatalf("selected %q, want %s (rising usage must not retire)", got, a)
+			}
+			executor.set(a, 66)
+			manager.checkUsageGuards(ctx, guard)
+			if auth, _ := manager.GetByID(a); auth.Disabled {
+				t.Fatal("a 4 point dip retired the credential")
 			}
 
-			executor.set(a, 45.5)
+			// The window reset: usage fell well below the peak of 70.
+			executor.set(a, 3)
 			manager.checkUsageGuards(ctx, guard)
 			auth, ok := manager.GetByID(a)
 			if !ok {
@@ -314,7 +323,7 @@ func TestUsageGuard_UseOnceReenabledStartsOver(t *testing.T) {
 	manager, executor, guard := newUsageGuardManager(t, "claude", model, once)
 	ctx := context.Background()
 
-	executor.set("claude-a", 10)
+	executor.set("claude-a", 30)
 	manager.checkUsageGuards(ctx, guard)
 	executor.set("claude-a", 20)
 	manager.checkUsageGuards(ctx, guard)
@@ -342,9 +351,9 @@ func TestUsageGuard_UseOnceReenabledStartsOver(t *testing.T) {
 	if _, ok := auth.Metadata[metadataUseOnceRetired]; ok {
 		t.Fatal("retired marker kept after re-enable")
 	}
-	executor.set("claude-a", 27.5)
+	executor.set("claude-a", 16.5)
 	manager.checkUsageGuards(ctx, guard)
 	if auth, _ := manager.GetByID("claude-a"); !auth.Disabled {
-		t.Fatal("did not retire 5.5 points above the new baseline")
+		t.Fatal("did not retire 5.5 points below the new baseline")
 	}
 }
