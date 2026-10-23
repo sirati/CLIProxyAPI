@@ -19,36 +19,36 @@ import (
 func TestDecideUsageGuard(t *testing.T) {
 	t.Parallel()
 	minimum := func(v float64) usageGuardSettings { return usageGuardSettings{minRemaining: v, hasMinRemaining: true} }
-	useOnce := func(baseline float64) usageGuardSettings {
-		return usageGuardSettings{useOnce: true, baseline: baseline, hasBaseline: true}
+	useOnce := func(lastRemaining float64) usageGuardSettings {
+		return usageGuardSettings{useOnce: true, lastRemaining: lastRemaining, hasLastRemaining: true}
 	}
 	for _, tc := range []struct {
-		name         string
-		settings     usageGuardSettings
-		used         float64
-		want         usageGuardAction
-		wantBaseline float64
-		setBaseline  bool
+		name      string
+		settings  usageGuardSettings
+		remaining float64
+		want      usageGuardAction
+		wantLast  float64
+		setLast   bool
 	}{
-		{"min: above", minimum(20), 70, usageGuardAllow, 0, false},
-		{"min: at threshold", minimum(20), 80, usageGuardAllow, 0, false},
-		{"min: below", minimum(20), 80.5, usageGuardHold, 0, false},
-		{"once: first reading sets baseline", usageGuardSettings{useOnce: true}, 30, usageGuardAllow, 30, true},
-		{"once: usage rising raises baseline", useOnce(30), 60, usageGuardAllow, 60, true},
-		{"once: unchanged", useOnce(30), 30, usageGuardAllow, 0, false},
-		{"once: dip within 5 points", useOnce(30), 25, usageGuardAllow, 0, false},
-		{"once: drop over 5 points is a reset", useOnce(30), 24.9, usageGuardRetire, 0, false},
-		{"once: empty", useOnce(99), 100, usageGuardRetire, 100, true},
-		{"once: window reset retires", useOnce(60), 4, usageGuardRetire, 0, false},
-		{"once: below minimum retires", usageGuardSettings{useOnce: true, baseline: 85, hasBaseline: true, minRemaining: 12, hasMinRemaining: true}, 89, usageGuardRetire, 89, true},
+		{"min: above", minimum(20), 30, usageGuardAllow, 0, false},
+		{"min: at threshold", minimum(20), 20, usageGuardAllow, 0, false},
+		{"min: below", minimum(20), 19.5, usageGuardHold, 0, false},
+		{"once: first reading is stored", usageGuardSettings{useOnce: true}, 70, usageGuardAllow, 70, true},
+		{"once: remainder falling is use", useOnce(70), 40, usageGuardAllow, 40, true},
+		{"once: unchanged", useOnce(70), 70, usageGuardAllow, 0, false},
+		{"once: remainder up 5 points", useOnce(70), 75, usageGuardAllow, 75, true},
+		{"once: remainder up over 5 points is a reset", useOnce(70), 75.1, usageGuardRetire, 75.1, true},
+		{"once: window reset retires", useOnce(40), 96, usageGuardRetire, 96, true},
+		{"once: empty", useOnce(1), 0, usageGuardRetire, 0, true},
+		{"once: below minimum retires", usageGuardSettings{useOnce: true, lastRemaining: 15, hasLastRemaining: true, minRemaining: 12, hasMinRemaining: true}, 11, usageGuardRetire, 11, true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			got := decideUsageGuard(tc.settings, tc.used)
+			got := decideUsageGuard(tc.settings, tc.remaining)
 			if got.action != tc.want {
 				t.Fatalf("action = %v (%s), want %v", got.action, got.reason, tc.want)
 			}
-			if got.setBaseline != tc.setBaseline || (tc.setBaseline && got.baseline != tc.wantBaseline) {
-				t.Fatalf("baseline = %v/%v, want %v/%v", got.baseline, got.setBaseline, tc.wantBaseline, tc.setBaseline)
+			if got.setLastRemaining != tc.setLast || (tc.setLast && got.lastRemaining != tc.wantLast) {
+				t.Fatalf("last remaining = %v/%v, want %v/%v", got.lastRemaining, got.setLastRemaining, tc.wantLast, tc.setLast)
 			}
 		})
 	}
@@ -108,9 +108,9 @@ type usageGuardExecutor struct {
 	calls    map[string]int
 }
 
-func (e *usageGuardExecutor) set(authID string, used float64) {
+func (e *usageGuardExecutor) setRemaining(authID string, remaining float64) {
 	e.mu.Lock()
-	e.weekly[authID] = used
+	e.weekly[authID] = 100 - remaining
 	e.mu.Unlock()
 }
 
@@ -203,7 +203,7 @@ func TestUsageGuard_MinRemainingHoldsAndReleases(t *testing.T) {
 			manager, executor, guard := newUsageGuardManager(t, provider, model, guarded, other)
 			ctx := context.Background()
 
-			executor.set(a, 50)
+			executor.setRemaining(a, 50)
 			manager.checkUsageGuards(ctx, guard)
 			if got := selectUsageGuarded(t, manager, provider, model); got != a {
 				t.Fatalf("selected %q, want %s (50%% left is above the minimum)", got, a)
@@ -212,7 +212,7 @@ func TestUsageGuard_MinRemainingHoldsAndReleases(t *testing.T) {
 				t.Fatalf("calls = %v, want only %s polled", executor.calls, a)
 			}
 
-			executor.set(a, 85)
+			executor.setRemaining(a, 15)
 			manager.checkUsageGuards(ctx, guard)
 			if got := selectUsageGuarded(t, manager, provider, model); got != b {
 				t.Fatalf("selected %q, want %s (%s has 15%% left, below 20%%)", got, b, a)
@@ -226,8 +226,8 @@ func TestUsageGuard_MinRemainingHoldsAndReleases(t *testing.T) {
 			}
 			executor.failures[a] = false
 
-			// The weekly window reset: usage dropped, so the hold is lifted.
-			executor.set(a, 2)
+			// The weekly window reset: remaining is back up, so the hold is lifted.
+			executor.setRemaining(a, 98)
 			manager.checkUsageGuards(ctx, guard)
 			if got := selectUsageGuarded(t, manager, provider, model); got != a {
 				t.Fatalf("selected %q, want %s (hold released)", got, a)
@@ -248,27 +248,29 @@ func TestUsageGuard_UseOnceRetiresOnWindowReset(t *testing.T) {
 			manager, executor, guard := newUsageGuardManager(t, provider, model, once, other)
 			ctx := context.Background()
 
-			executor.set(a, 40)
+			executor.setRemaining(a, 60)
 			manager.checkUsageGuards(ctx, guard)
 			auth, _ := manager.GetByID(a)
-			if baseline, _ := metadataNumber(auth.Metadata[metadataUseOnceBaseline]); baseline != 40 {
-				t.Fatalf("baseline = %v, want 40", auth.Metadata[metadataUseOnceBaseline])
+			if last, _ := metadataNumber(auth.Metadata[metadataUseOnceLastRemaining]); last != 60 {
+				t.Fatalf("last remaining = %v, want 60", auth.Metadata[metadataUseOnceLastRemaining])
 			}
 
-			// Using the credential is the point: rising usage never retires it.
-			executor.set(a, 70)
+			// Using the credential is the point: a falling remainder never retires it.
+			executor.setRemaining(a, 30)
 			manager.checkUsageGuards(ctx, guard)
 			if got := selectUsageGuarded(t, manager, provider, model); got != a {
-				t.Fatalf("selected %q, want %s (rising usage must not retire)", got, a)
+				t.Fatalf("selected %q, want %s (a falling remainder must not retire)", got, a)
 			}
-			executor.set(a, 66)
-			manager.checkUsageGuards(ctx, guard)
-			if auth, _ := manager.GetByID(a); auth.Disabled {
-				t.Fatal("a 4 point dip retired the credential")
+			for _, remaining := range []float64{34, 38} {
+				executor.setRemaining(a, remaining)
+				manager.checkUsageGuards(ctx, guard)
+				if auth, _ := manager.GetByID(a); auth.Disabled {
+					t.Fatalf("remaining rising 4 points (to %v%%) retired the credential", remaining)
+				}
 			}
 
-			// The window reset: usage fell well below the peak of 70.
-			executor.set(a, 3)
+			// The window reset: remaining jumped from 38% to 97%.
+			executor.setRemaining(a, 97)
 			manager.checkUsageGuards(ctx, guard)
 			auth, ok := manager.GetByID(a)
 			if !ok {
@@ -282,7 +284,7 @@ func TestUsageGuard_UseOnceRetiresOnWindowReset(t *testing.T) {
 			}
 
 			// Retirement is permanent: a later reset does not bring it back.
-			executor.set(a, 0)
+			executor.setRemaining(a, 100)
 			calls := executor.calls[a]
 			manager.checkUsageGuards(ctx, guard)
 			if auth, _ := manager.GetByID(a); !auth.Disabled || executor.calls[a] != calls {
@@ -298,7 +300,7 @@ func TestUsageGuard_ReleaseLeavesUpstreamCooldown(t *testing.T) {
 	manager, executor, guard := newUsageGuardManager(t, "claude", model, guarded)
 	ctx := context.Background()
 
-	executor.set("claude-a", 90)
+	executor.setRemaining("claude-a", 10)
 	manager.checkUsageGuards(ctx, guard)
 	// An upstream 429 replaces the hold with its own longer cooldown.
 	upstream := time.Now().Add(3 * time.Hour)
@@ -309,7 +311,7 @@ func TestUsageGuard_ReleaseLeavesUpstreamCooldown(t *testing.T) {
 	}); errMutate != nil {
 		t.Fatal(errMutate)
 	}
-	executor.set("claude-a", 10)
+	executor.setRemaining("claude-a", 90)
 	manager.checkUsageGuards(ctx, guard)
 	auth, _ := manager.GetByID("claude-a")
 	if !auth.Quota.Exceeded || !auth.Quota.NextRecoverAt.Equal(upstream) {
@@ -323,9 +325,9 @@ func TestUsageGuard_UseOnceReenabledStartsOver(t *testing.T) {
 	manager, executor, guard := newUsageGuardManager(t, "claude", model, once)
 	ctx := context.Background()
 
-	executor.set("claude-a", 30)
+	executor.setRemaining("claude-a", 70)
 	manager.checkUsageGuards(ctx, guard)
-	executor.set("claude-a", 20)
+	executor.setRemaining("claude-a", 80)
 	manager.checkUsageGuards(ctx, guard)
 	if auth, _ := manager.GetByID("claude-a"); !auth.Disabled {
 		t.Fatal("precondition: credential did not retire")
@@ -339,21 +341,21 @@ func TestUsageGuard_UseOnceReenabledStartsOver(t *testing.T) {
 	}); errMutate != nil {
 		t.Fatal(errMutate)
 	}
-	executor.set("claude-a", 22)
+	executor.setRemaining("claude-a", 78)
 	manager.checkUsageGuards(ctx, guard)
 	auth, _ := manager.GetByID("claude-a")
 	if auth.Disabled {
-		t.Fatal("re-enabled credential retired again against its old baseline")
+		t.Fatal("re-enabled credential retired again against its old remainder")
 	}
-	if baseline, _ := metadataNumber(auth.Metadata[metadataUseOnceBaseline]); baseline != 22 {
-		t.Fatalf("baseline = %v, want 22", auth.Metadata[metadataUseOnceBaseline])
+	if last, _ := metadataNumber(auth.Metadata[metadataUseOnceLastRemaining]); last != 78 {
+		t.Fatalf("last remaining = %v, want 78", auth.Metadata[metadataUseOnceLastRemaining])
 	}
 	if _, ok := auth.Metadata[metadataUseOnceRetired]; ok {
 		t.Fatal("retired marker kept after re-enable")
 	}
-	executor.set("claude-a", 16.5)
+	executor.setRemaining("claude-a", 83.5)
 	manager.checkUsageGuards(ctx, guard)
 	if auth, _ := manager.GetByID("claude-a"); !auth.Disabled {
-		t.Fatal("did not retire 5.5 points below the new baseline")
+		t.Fatal("did not retire when remaining rose 5.5 points")
 	}
 }

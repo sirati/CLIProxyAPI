@@ -25,13 +25,16 @@ const (
 	MetadataMinRemaining = "min_remaining"
 	// MetadataUseOnce retires the credential for good (disabled, login kept)
 	// once its weekly window is empty or below MetadataMinRemaining, or once
-	// the window resets: weekly usage falls more than useOnceResetDrop points
-	// below the highest usage seen. It drains one window's quota, then stops.
+	// the window resets: the weekly remainder rose more than useOnceResetRise
+	// points since the previous check. It drains one window's quota, then stops.
 	MetadataUseOnce = "use_once"
 
-	// metadataUseOnceBaseline is the highest weekly usage, in percent, seen
-	// since use_once was set. It is kept in the auth file across restarts.
-	metadataUseOnceBaseline = "use_once_baseline"
+	// metadataUseOnceLastRemaining is the weekly remainder, in percent, at the
+	// previous check. It is kept in the auth file across restarts.
+	metadataUseOnceLastRemaining = "use_once_last_remaining"
+	// metadataUseOnceOldBaseline held weekly usage, not the remainder, in
+	// earlier builds. It is dropped on the next check.
+	metadataUseOnceOldBaseline = "use_once_baseline"
 	// metadataUseOnceRetired records why and when a use_once credential retired.
 	metadataUseOnceRetired = "use_once_retired"
 )
@@ -39,7 +42,7 @@ const (
 const (
 	usageGuardInterval     = 5 * time.Minute
 	usageGuardFetchTimeout = 30 * time.Second
-	useOnceResetDrop       = 5.0
+	useOnceResetRise       = 5.0
 
 	claudeUsageURL = "https://api.anthropic.com/api/oauth/usage"
 	codexUsageURL  = "https://chatgpt.com/backend-api/wham/usage"
@@ -54,11 +57,11 @@ const (
 var usageGuardProviders = map[string]bool{"claude": true, "codex": true}
 
 type usageGuardSettings struct {
-	minRemaining    float64
-	hasMinRemaining bool
-	useOnce         bool
-	baseline        float64
-	hasBaseline     bool
+	minRemaining     float64
+	hasMinRemaining  bool
+	useOnce          bool
+	lastRemaining    float64
+	hasLastRemaining bool
 	// retired is set when a use_once credential retired and was re-enabled since.
 	retired bool
 }
@@ -70,11 +73,11 @@ func usageGuardSettingsOf(auth *Auth) (usageGuardSettings, bool) {
 	}
 	settings.minRemaining, settings.hasMinRemaining = metadataNumber(auth.Metadata[MetadataMinRemaining])
 	settings.useOnce, _ = metadataBool(auth.Metadata[MetadataUseOnce])
-	settings.baseline, settings.hasBaseline = metadataNumber(auth.Metadata[metadataUseOnceBaseline])
+	settings.lastRemaining, settings.hasLastRemaining = metadataNumber(auth.Metadata[metadataUseOnceLastRemaining])
 	_, settings.retired = auth.Metadata[metadataUseOnceRetired]
 	if settings.retired {
-		// Re-enabled after retiring: start over from the current usage.
-		settings.hasBaseline = false
+		// Re-enabled after retiring: start over from the current remainder.
+		settings.hasLastRemaining = false
 	}
 	if settings.hasMinRemaining && settings.minRemaining <= 0 {
 		settings.hasMinRemaining = false
@@ -93,16 +96,16 @@ const (
 type usageGuardDecision struct {
 	action usageGuardAction
 	reason string
-	// baseline is the use_once baseline to store; set only when it changes.
-	baseline    float64
-	setBaseline bool
+	// lastRemaining is the remainder to store for the next check; set only
+	// when it changes.
+	lastRemaining    float64
+	setLastRemaining bool
 }
 
-// decideUsageGuard applies a credential's settings to its weekly usage in
-// percent (0-100).
-func decideUsageGuard(settings usageGuardSettings, weeklyUsed float64) usageGuardDecision {
+// decideUsageGuard applies a credential's settings to the share of its
+// weekly window that is left, in percent (0-100).
+func decideUsageGuard(settings usageGuardSettings, remaining float64) usageGuardDecision {
 	var decision usageGuardDecision
-	remaining := 100 - weeklyUsed
 	belowMinimum := settings.hasMinRemaining && remaining < settings.minRemaining
 	if !settings.useOnce {
 		if belowMinimum {
@@ -112,11 +115,14 @@ func decideUsageGuard(settings usageGuardSettings, weeklyUsed float64) usageGuar
 		return decision
 	}
 
-	baseline := settings.baseline
-	if !settings.hasBaseline || weeklyUsed > baseline {
-		// First reading, or more used: a reset is measured from the peak.
-		baseline = weeklyUsed
-		decision.baseline, decision.setBaseline = baseline, true
+	// Compare with the previous check: using the credential lowers the
+	// remainder, only a reset raises it.
+	previousRemaining := settings.lastRemaining
+	if !settings.hasLastRemaining {
+		previousRemaining = remaining
+	}
+	if !settings.hasLastRemaining || remaining != settings.lastRemaining {
+		decision.lastRemaining, decision.setLastRemaining = remaining, true
 	}
 	switch {
 	case remaining <= 0:
@@ -125,9 +131,9 @@ func decideUsageGuard(settings usageGuardSettings, weeklyUsed float64) usageGuar
 	case belowMinimum:
 		decision.action = usageGuardRetire
 		decision.reason = fmt.Sprintf("weekly remaining %.1f%% is below the minimum %.1f%%", remaining, settings.minRemaining)
-	case baseline-weeklyUsed > useOnceResetDrop:
+	case remaining-previousRemaining > useOnceResetRise:
 		decision.action = usageGuardRetire
-		decision.reason = fmt.Sprintf("weekly window reset: usage fell from %.1f%% to %.1f%%", baseline, weeklyUsed)
+		decision.reason = fmt.Sprintf("weekly window reset: remaining rose from %.1f%% to %.1f%%", previousRemaining, remaining)
 	}
 	return decision
 }
@@ -278,12 +284,16 @@ func (m *Manager) checkUsageGuard(ctx context.Context, guard *usageGuard, auth *
 		}
 		return
 	}
-	decision := decideUsageGuard(settings, weeklyUsed)
-	if decision.setBaseline {
-		m.setUsageGuardMetadata(ctx, auth.ID, metadataUseOnceBaseline, decision.baseline)
+	remaining := 100 - weeklyUsed
+	decision := decideUsageGuard(settings, remaining)
+	if decision.setLastRemaining {
+		m.setUsageGuardMetadata(ctx, auth.ID, metadataUseOnceLastRemaining, decision.lastRemaining)
 	}
 	if settings.retired {
 		m.deleteUsageGuardMetadata(ctx, auth.ID, metadataUseOnceRetired)
+	}
+	if _, stale := auth.Metadata[metadataUseOnceOldBaseline]; stale {
+		m.deleteUsageGuardMetadata(ctx, auth.ID, metadataUseOnceOldBaseline)
 	}
 	switch decision.action {
 	case usageGuardRetire:
@@ -295,7 +305,7 @@ func (m *Manager) checkUsageGuard(ctx context.Context, guard *usageGuard, auth *
 		m.applyUsageHold(ctx, guard, auth.ID, decision.reason)
 	default:
 		if until, held := guard.held(auth.ID); held {
-			log.Infof("usage guard: releasing %s: weekly remaining %.1f%%", auth.ID, 100-weeklyUsed)
+			log.Infof("usage guard: releasing %s: weekly remaining %.1f%%", auth.ID, remaining)
 			m.releaseUsageHold(ctx, guard, auth.ID, until)
 		}
 	}
