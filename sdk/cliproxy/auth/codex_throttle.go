@@ -7,45 +7,69 @@ import (
 	"fmt"
 	"math"
 	"net/http"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
 
+	internallogging "github.com/router-for-me/CLIProxyAPI/v8/internal/logging"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/executor"
+	log "github.com/sirupsen/logrus"
 	"github.com/tidwall/gjson"
 )
 
-// A Codex account answers bursts with 429 {"detail":"Rate limit exceeded"}.
-// That limit is no request rate, token rate or concurrency the proxy can see:
-// other accounts serve ten times the load without it. So each account learns
-// its pace from those answers instead. A 429 halves the start rate the
-// account just saw, every quiet minute gives a little back, and requests are
-// spaced to that rate. A request whose turn is at most a minute away waits
-// for it, which the client sees as a slow answer; one further out is told to
-// retry when its turn comes, and the turn stays reserved for it, so it is
-// first in line when it returns.
+// A Codex account answers bursts with 429 {"detail":"Rate limit exceeded"},
+// a limit the proxy cannot predict: it is no request rate, token rate or
+// concurrency, and other accounts serve ten times the load without it. It
+// clears quickly, though: the first request started after a 429 succeeded
+// after a median 25s (p90 55s), and requests keep getting through during the
+// burst. So an account that answers 429 pauses rather than slows down.
+//
+// The pause lasts what the upstream's Retry-After says, otherwise what the
+// account has learned it needs, starting from those 25s. Requests meanwhile
+// wait in the proxy (the client sees a slow answer) or, when the pause is
+// more than a minute out, are told to retry when it ends. After the pause
+// one request goes first as a probe. If it gets through, everything waiting
+// follows in quick succession and the next pause is a little shorter; if it
+// is refused, the pause starts over and is longer. The pause therefore
+// settles just above what the account needs, and a retry rarely lands in a
+// burst that is still on.
 const (
-	codexPaceHold       = time.Minute
-	codexPaceMinRate    = 4.0  // starts per minute
-	codexPaceFreeRate   = 60.0 // reaching this rate lifts the throttle
-	codexPaceStep       = 2.0  // starts per minute regained per quiet minute
-	codexPacePause      = 15 * time.Second
-	codexPaceBurst      = 10 * time.Second // 429s this close together are one burst
-	codexPaceReserveTTL = 2 * time.Minute  // past its turn, an unclaimed reservation lapses
+	codexPaceHold       = time.Minute // longest a request waits in the proxy
+	codexPaceInitial    = 25 * time.Second
+	codexPaceMin        = 5 * time.Second
+	codexPaceMax        = 2 * time.Minute
+	codexPaceGrow       = 1.25
+	codexPaceShrink     = 0.9
+	codexPaceSpread     = 250 * time.Millisecond // between requests released after a pause
+	codexPaceSlowPoll   = 100 * time.Millisecond // re-check of a request waiting for a slow-start slot
+	codexPaceTellTTL    = 5 * time.Minute
+	codexPaceForget     = 10 * time.Minute // quiet this long, the account runs free again
 	codexPaceMaxTells   = 3                // after this many retries the client is told the reset instead
-	codexPaceRetries    = 3                // upstream 429s absorbed in one dispatch
 	codexPacedErrorCode = "codex_paced"
 )
 
 type codexPace struct {
-	rate        float64 // starts per minute; 0 runs unthrottled
-	next        time.Time
+	pause       time.Duration // learned pause; 0 until the first 429
 	pausedUntil time.Time
+	recovering  bool          // a pause ended and no request has got through since
+	probe       chan struct{} // closed when the probe after a pause resolves; nil if none is out
+	release     time.Time     // next free start while waiting requests are released
+	budget      int           // starts the account takes after a pause before it refuses; 0 is unknown
+	preventive  bool          // the current pause was taken before a 429
+	used        int           // starts since the last pause ended
+	releasedAt  time.Time     // when the last pause ended
+	burstAt     time.Time     // when the last burst began
+	got         int           // successes sent between releasedAt and the next burst
+	pending     int           // unanswered requests sent since the pause ended
+	window      int           // how many of those may be out while the budget is unknown
 	lastLimited time.Time
-	lastRaise   time.Time
-	starts      []time.Time
-	reserved    map[string]time.Time
-	tells       map[string]int
+	tells       map[string]codexTell
+}
+
+type codexTell struct {
+	count int
+	at    time.Time
 }
 
 type codexThrottle struct {
@@ -66,107 +90,285 @@ func (m *Manager) codexThrottle() *codexThrottle {
 func (t *codexThrottle) pace(authID string) *codexPace {
 	p := t.paces[authID]
 	if p == nil {
-		p = &codexPace{reserved: map[string]time.Time{}, tells: map[string]int{}}
+		p = &codexPace{tells: map[string]codexTell{}}
 		t.paces[authID] = p
 	}
 	return p
 }
 
-// relax gives back rate for every quiet minute and lifts a throttle that has
-// climbed back to the free rate.
-func (p *codexPace) relax(now time.Time) {
-	if p.rate == 0 || now.Sub(p.lastLimited) < time.Minute {
-		return
-	}
-	if minutes := math.Floor(now.Sub(p.lastRaise).Minutes()); minutes >= 1 {
-		p.rate += codexPaceStep * minutes
-		p.lastRaise = p.lastRaise.Add(time.Duration(minutes) * time.Minute)
-	}
-	if p.rate >= codexPaceFreeRate {
-		p.rate = 0
-	}
+// codexAdmission is what a request does next.
+type codexAdmission struct {
+	wait     time.Duration // sleep this long, then ask again
+	probe    <-chan struct{}
+	dispatch bool // dispatch now
+	isProbe  bool
+	tell     time.Duration // answer the client: retry after this
 }
 
-func (p *codexPace) started(at time.Time) {
-	cut := 0
-	for cut < len(p.starts) && at.Sub(p.starts[cut]) > time.Minute {
-		cut++
-	}
-	p.starts = append(p.starts[cut:], at)
-}
-
-func (p *codexPace) lapse(now time.Time) {
-	for key, slot := range p.reserved {
-		if now.Sub(slot) > codexPaceReserveTTL {
-			delete(p.reserved, key)
-			delete(p.tells, key)
-		}
-	}
-}
-
-// turn assigns request key its start. It reports how long to wait for it and
-// whether the request is held for it; a request that may not be held, or whose
-// turn is too far out, keeps the turn reserved for its retry.
-func (t *codexThrottle) turn(authID, key string, now time.Time, mayHold bool) (time.Duration, bool) {
+// admit decides the next step of a request for key that has waited since
+// arrived.
+func (t *codexThrottle) admit(authID, key string, now, arrived time.Time) codexAdmission {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	p := t.pace(authID)
-	p.relax(now)
-	p.lapse(now)
-	start, reserved := p.reserved[key]
-	if !reserved {
-		start = now
-		if p.rate > 0 || now.Before(p.pausedUntil) {
-			start = latest(now, p.next, p.pausedUntil)
-			if p.rate > 0 {
-				p.next = start.Add(time.Duration(float64(time.Minute) / p.rate))
-			}
+	held := now.Sub(arrived)
+	if now.Before(p.pausedUntil) {
+		wait := p.pausedUntil.Sub(now)
+		if held+wait > codexPaceHold {
+			return p.tellLocked(key, wait, now)
 		}
+		return codexAdmission{wait: wait}
 	}
-	wait := start.Sub(now)
-	if !mayHold || wait > codexPaceHold {
-		if key != "" {
-			p.reserved[key] = start
-			p.tells[key]++
+	if p.recovering {
+		if p.probe != nil {
+			return codexAdmission{probe: p.probe}
 		}
-		return max(wait, 0), false
+		p.probe = make(chan struct{})
+		return codexAdmission{dispatch: true, isProbe: true}
 	}
-	delete(p.reserved, key)
+	if !p.releasedAt.IsZero() && now.Sub(p.lastLimited) > codexPaceForget {
+		p.budget, p.releasedAt = 0, time.Time{}
+	}
+	// The budget is spent: pause before the account refuses, not after.
+	if p.budget > 0 && p.used >= p.budget {
+		p.pausedUntil = now.Add(p.pause)
+		p.recovering = true
+		p.preventive = true
+		if held+p.pause > codexPaceHold {
+			return p.tellLocked(key, p.pause, now)
+		}
+		return codexAdmission{wait: p.pause}
+	}
+	// Without a budget, a release starts slow: one more request may be out for
+	// every one that got through, so a wave cannot overshoot the account before
+	// its first refusal comes back.
+	if p.budget == 0 && !p.releasedAt.IsZero() && p.pending >= p.window {
+		if held+codexPaceSlowPoll > codexPaceHold {
+			return p.tellLocked(key, codexPaceMin, now)
+		}
+		return codexAdmission{wait: codexPaceSlowPoll}
+	}
+	p.used++
+	if !p.releasedAt.IsZero() {
+		p.pending++
+	}
 	delete(p.tells, key)
-	p.started(latest(now, start))
-	return max(wait, 0), true
+	if now.Before(p.release) {
+		wait := p.release.Sub(now)
+		p.release = p.release.Add(codexPaceSpread)
+		return codexAdmission{wait: wait, dispatch: true}
+	}
+	return codexAdmission{dispatch: true}
+}
+
+func (p *codexPace) tellLocked(key string, after time.Duration, now time.Time) codexAdmission {
+	for k, tell := range p.tells {
+		if now.Sub(tell.at) > codexPaceTellTTL {
+			delete(p.tells, k)
+		}
+	}
+	if key != "" {
+		tell := p.tells[key]
+		p.tells[key] = codexTell{count: tell.count + 1, at: now}
+	}
+	return codexAdmission{tell: after}
 }
 
 func (t *codexThrottle) told(authID, key string) int {
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	return t.pace(authID).tells[key]
+	return t.pace(authID).tells[key].count
 }
 
-// limited records an upstream 429 on authID.
-func (t *codexThrottle) limited(authID string, now time.Time) {
+// limited records an upstream 429 on authID. retryAfter is the upstream's
+// own wait, if it named one. A refused probe lengthens the learned pause;
+// 429s from requests sent before the pause began belong to the same burst.
+func (t *codexThrottle) limited(authID string, now time.Time, retryAfter time.Duration, wasProbe bool) time.Duration {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	p := t.pace(authID)
-	p.relax(now)
-	if now.Sub(p.lastLimited) >= codexPaceBurst {
-		seen := 0.0
-		for _, at := range p.starts {
-			if now.Sub(at) <= time.Minute {
-				seen++
-			}
-		}
-		if p.rate > 0 && p.rate < seen {
-			seen = p.rate
-		}
-		p.rate = max(codexPaceMinRate, seen/2)
-		p.lastRaise = now
+	first := p.pause == 0
+	if first {
+		p.pause = codexPaceInitial
 	}
 	p.lastLimited = now
-	p.pausedUntil = latest(p.pausedUntil, now.Add(codexPacePause))
-	p.next = latest(p.next, p.pausedUntil)
+	if wasProbe {
+		p.pause = min(time.Duration(float64(p.pause)*codexPaceGrow), codexPaceMax)
+		p.resolveProbeLocked()
+	} else if now.Before(p.pausedUntil) || p.recovering {
+		if until := now.Add(retryAfter); retryAfter > 0 && until.After(p.pausedUntil) {
+			p.pausedUntil = until
+		}
+		return p.pausedUntil.Sub(now)
+	}
+	// A new burst: what got through since the last pause is what the account
+	// takes; successes of requests sent before now still arrive and count.
+	p.burstAt = now
+	if !wasProbe && !first && p.got > 0 {
+		p.budget = p.got
+	}
+	p.preventive = false
+	pause := p.pause
+	if retryAfter > 0 {
+		pause = retryAfter
+	}
+	p.pausedUntil = now.Add(pause)
+	p.recovering = true
+	return pause
 }
 
+// cleared records that a request sent at dispatched got through: a probe ends
+// the recovery, shortens the next pause and releases everything that waited
+// for it. A request sent before the pause began proves nothing: it was
+// admitted before the burst, and letting it end the pause is how a 429
+// backoff keeps starting over.
+func (t *codexThrottle) cleared(authID string, now, dispatched time.Time, wasProbe bool) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	p := t.pace(authID)
+	if !p.releasedAt.IsZero() && !dispatched.Before(p.releasedAt) && (p.burstAt.Before(p.releasedAt) || dispatched.Before(p.burstAt)) {
+		p.got++
+		p.window++
+		if !p.burstAt.Before(p.releasedAt) {
+			p.budget = max(p.budget, p.got)
+		}
+	}
+	if !p.recovering || (!wasProbe && dispatched.Before(p.pausedUntil)) {
+		return
+	}
+	if wasProbe {
+		p.pause = max(time.Duration(float64(p.pause)*codexPaceShrink), codexPaceMin)
+		// A pause taken early that the account did not need: try one more start
+		// in the next round.
+		if p.preventive && p.budget > 0 {
+			p.budget++
+		}
+	}
+	p.recovering = false
+	p.preventive = false
+	p.used = 1
+	p.releasedAt = now
+	p.got = 1
+	p.pending = 0
+	p.window = 2
+	p.release = now.Add(codexPaceSpread)
+	p.resolveProbeLocked()
+}
+
+// abandoned frees the probe slot of a probe that never got an answer.
+func (t *codexThrottle) abandoned(authID string) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.pace(authID).resolveProbeLocked()
+}
+
+func (p *codexPace) resolveProbeLocked() {
+	if p.probe != nil {
+		close(p.probe)
+		p.probe = nil
+	}
+}
+
+// upstreamRetryAfter reads the wait an upstream 429 named in its headers.
+func upstreamRetryAfter(headers http.Header) time.Duration {
+	if ms, err := strconv.ParseFloat(strings.TrimSpace(headers.Get("Retry-After-Ms")), 64); err == nil && ms > 0 {
+		return time.Duration(ms * float64(time.Millisecond))
+	}
+	value := strings.TrimSpace(headers.Get("Retry-After"))
+	if seconds, err := strconv.ParseFloat(value, 64); err == nil && seconds > 0 {
+		return time.Duration(seconds * float64(time.Second))
+	}
+	if at, err := http.ParseTime(value); err == nil {
+		return time.Until(at)
+	}
+	return 0
+}
+
+// codexRateLimitHeaders keeps the headers of a 429 that may say how long it lasts.
+func codexRateLimitHeaders(headers http.Header) map[string]string {
+	out := map[string]string{}
+	for key, values := range headers {
+		lower := strings.ToLower(key)
+		if strings.Contains(lower, "retry") || strings.Contains(lower, "ratelimit") || strings.Contains(lower, "rate-limit") || strings.HasPrefix(lower, "x-codex-") {
+			out[lower] = strings.Join(values, ",")
+		}
+	}
+	return out
+}
+
+func sleepCtx(ctx context.Context, d time.Duration) error {
+	if d <= 0 {
+		return nil
+	}
+	timer := time.NewTimer(d)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
+	}
+}
+
+// paced runs dispatch for a Codex account at the account's pace.
+func paced[T any](m *Manager, ctx context.Context, auth *Auth, opts cliproxyexecutor.Options, dispatch func(context.Context) (T, error)) (T, error) {
+	var zero T
+	if m == nil || auth == nil || auth.Provider != "codex" {
+		return dispatch(ctx)
+	}
+	t := m.codexThrottle()
+	key := codexPaceKey(opts.Headers)
+	arrived := time.Now()
+	for {
+		now := time.Now()
+		next := t.admit(auth.ID, key, now, arrived)
+		switch {
+		case next.tell > 0:
+			return zero, newCodexPacedError(next.tell, t.told(auth.ID, key) >= codexPaceMaxTells)
+		case next.probe != nil:
+			left := codexPaceHold - now.Sub(arrived)
+			if left <= 0 {
+				return zero, newCodexPacedError(codexPaceMin, t.told(auth.ID, key) >= codexPaceMaxTells)
+			}
+			timer := time.NewTimer(left)
+			select {
+			case <-ctx.Done():
+				timer.Stop()
+				return zero, ctx.Err()
+			case <-next.probe:
+			case <-timer.C:
+			}
+			timer.Stop()
+			continue
+		case !next.dispatch:
+			if err := sleepCtx(ctx, next.wait); err != nil {
+				return zero, err
+			}
+			continue
+		}
+		if err := sleepCtx(ctx, next.wait); err != nil {
+			if next.isProbe {
+				t.abandoned(auth.ID)
+			}
+			return zero, err
+		}
+		dispatched := time.Now()
+		out, err := dispatch(ctx)
+		t.settled(auth.ID, dispatched)
+		if isCodexRateLimit(err) {
+			headers := internallogging.GetResponseHeaders(ctx)
+			pause := t.limited(auth.ID, time.Now(), upstreamRetryAfter(headers), next.isProbe)
+			log.Infof("codex pace: %s answered 429 (probe=%v); pausing %s; upstream headers %v", auth.ID, next.isProbe, pause.Round(time.Second), codexRateLimitHeaders(headers))
+			continue
+		}
+		if ctx.Err() != nil && next.isProbe {
+			t.abandoned(auth.ID)
+		} else {
+			t.cleared(auth.ID, time.Now(), dispatched, next.isProbe)
+		}
+		return out, err
+	}
+}
 func latest(times ...time.Time) time.Time {
 	var out time.Time
 	for _, at := range times {
@@ -248,39 +450,17 @@ func isCodexPacedResult(err *Error) bool {
 	return err != nil && err.Code == codexPacedErrorCode
 }
 
-// paced runs dispatch for a Codex account at the account's pace: it waits
-// for the request's turn, and absorbs a 429 by waiting for the next turn when
-// that is close, or hands back a codexPacedError naming it.
-func paced[T any](m *Manager, ctx context.Context, auth *Auth, opts cliproxyexecutor.Options, dispatch func(context.Context) (T, error)) (T, error) {
-	var zero T
-	if m == nil || auth == nil || auth.Provider != "codex" {
-		return dispatch(ctx)
-	}
-	t := m.codexThrottle()
-	key := codexPaceKey(opts.Headers)
-	for attempt := 0; ; attempt++ {
-		wait, hold := t.turn(auth.ID, key, time.Now(), attempt < codexPaceRetries)
-		if !hold {
-			return zero, newCodexPacedError(wait, t.told(auth.ID, key) >= codexPaceMaxTells)
-		}
-		if wait > 0 {
-			timer := time.NewTimer(wait)
-			select {
-			case <-ctx.Done():
-				timer.Stop()
-				return zero, ctx.Err()
-			case <-timer.C:
-			}
-		}
-		out, err := dispatch(ctx)
-		if !isCodexRateLimit(err) {
-			return out, err
-		}
-		t.limited(auth.ID, time.Now())
-	}
-}
-
 // NewCodexPacedError returns the error a paced Codex request fails with.
 func NewCodexPacedError(after time.Duration, exhausted bool) error {
 	return newCodexPacedError(after, exhausted)
+}
+
+// settled records that a request sent at dispatched has its answer.
+func (t *codexThrottle) settled(authID string, dispatched time.Time) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	p := t.pace(authID)
+	if !p.releasedAt.IsZero() && !dispatched.Before(p.releasedAt) && p.pending > 0 {
+		p.pending--
+	}
 }
