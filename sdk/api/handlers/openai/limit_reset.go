@@ -2,6 +2,8 @@ package openai
 
 import (
 	"encoding/json"
+	"fmt"
+	"math"
 	"net/http"
 	"strconv"
 	"time"
@@ -9,6 +11,8 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/gorilla/websocket"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/interfaces"
+	"github.com/router-for-me/CLIProxyAPI/v8/sdk/api/handlers"
+	coreauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
 )
 
 // Exhausted Codex credentials are answered the way the ChatGPT backend
@@ -32,8 +36,8 @@ func (h *OpenAIResponsesAPIHandler) codexLimit(msg *interfaces.ErrorMessage) (co
 	if h == nil {
 		return codexLimitDetail{}, nil, false
 	}
-	reset, ok := h.LimitReset(msg, "codex")
-	if !ok {
+	reset, answer := h.LimitReset(msg, "codex")
+	if answer != handlers.LimitReached {
 		return codexLimitDetail{}, nil, false
 	}
 	seconds := int64(reset.Round(time.Second).Seconds())
@@ -53,27 +57,70 @@ func (h *OpenAIResponsesAPIHandler) codexLimit(msg *interfaces.ErrorMessage) (co
 	return detail, headers, true
 }
 
-// WriteErrorResponse answers exhausted credentials with a Codex usage limit
-// and every other error as the base handler does.
+// codexRetry answers a request the account is pacing, or one whose credentials
+// free up within a minute, with a plain 429 and the wait: Codex sleeps exactly
+// that long and retries, without failing the turn. Once a paced client has
+// retried often enough that its own retries could run out, the wait is
+// answered as a usage limit instead (codexLimit), which hands the resume to
+// T3 Code.
+func (h *OpenAIResponsesAPIHandler) codexRetry(msg *interfaces.ErrorMessage) (map[string]any, http.Header, bool) {
+	if h == nil || msg == nil {
+		return nil, nil, false
+	}
+	after, exhausted, paced := coreauth.CodexRetryAfter(msg.Error)
+	if paced && exhausted {
+		return nil, nil, false
+	}
+	if !paced {
+		reset, answer := h.LimitReset(msg, "codex")
+		if answer != handlers.RetrySoon {
+			return nil, nil, false
+		}
+		after = reset
+	}
+	seconds := int64(math.Ceil(after.Seconds()))
+	detail := map[string]any{
+		"type":    "rate_limit_exceeded",
+		"code":    "rate_limit_exceeded",
+		"message": fmt.Sprintf("The Codex account is pacing requests; retry in %ds.", seconds),
+	}
+	headers := http.Header{}
+	headers.Set("Content-Type", "application/json")
+	headers.Set("Retry-After", strconv.FormatInt(seconds, 10))
+	return detail, headers, true
+}
+
+// WriteErrorResponse answers a paced request with its turn, exhausted
+// credentials with a Codex usage limit, and every other error as the base
+// handler does.
 func (h *OpenAIResponsesAPIHandler) WriteErrorResponse(c *gin.Context, msg *interfaces.ErrorMessage) {
-	if detail, headers, ok := h.codexLimit(msg); ok {
+	if detail, headers, ok := h.codexRetry(msg); ok {
+		body, _ := json.Marshal(map[string]any{"error": detail})
+		msg = &interfaces.ErrorMessage{StatusCode: http.StatusTooManyRequests, DirectResponse: true, Body: body, Headers: headers}
+	} else if detail, headers, ok := h.codexLimit(msg); ok {
 		body, _ := json.Marshal(codexLimitBody{Error: detail})
 		msg = &interfaces.ErrorMessage{StatusCode: http.StatusTooManyRequests, DirectResponse: true, Body: body, Headers: headers}
 	}
 	h.BaseAPIHandler.WriteErrorResponse(c, msg)
 }
 
-// writeResponsesWebsocketTerminalError sends exhausted credentials to the
-// client as the websocket form of a usage limit, which a quota failure
-// otherwise never shows: the client would reconnect and fail again.
+// writeResponsesWebsocketTerminalError sends a paced request or exhausted
+// credentials to the client in the websocket form of the HTTP answer, which a
+// quota failure otherwise never shows: the client would reconnect and fail
+// again.
 func (h *OpenAIResponsesAPIHandler) writeResponsesWebsocketTerminalError(
 	writer *responsesWebsocketWriter,
 	wsTimelineLog websocketTimelineAppender,
 	errMsg *interfaces.ErrorMessage,
 	payload []byte,
 ) ([]byte, bool, error) {
-	detail, headers, ok := h.codexLimit(errMsg)
-	if !ok {
+	var detail any
+	retry, headers, ok := h.codexRetry(errMsg)
+	if ok {
+		detail = retry
+	} else if limit, limitHeaders, isLimit := h.codexLimit(errMsg); isLimit {
+		detail, headers = limit, limitHeaders
+	} else {
 		return writeResponsesWebsocketTerminalError(writer, wsTimelineLog, errMsg, payload)
 	}
 	eventHeaders := make(map[string]string, len(headers))

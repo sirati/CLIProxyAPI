@@ -104,3 +104,35 @@ func TestResponsesWebsocketAnswersAUsageLimit(t *testing.T) {
 		t.Fatalf("payload = %s, want a full primary window resetting at %s", payload, resetsAt)
 	}
 }
+
+func TestResponsesWriteErrorResponseAnswersAPacedRequestWithItsTurn(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	recorder := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(recorder)
+	h := NewOpenAIResponsesAPIHandler(handlers.NewBaseAPIHandlers(&sdkconfig.SDKConfig{}, nil))
+
+	h.WriteErrorResponse(c, &interfaces.ErrorMessage{StatusCode: http.StatusTooManyRequests, Error: coreauth.NewCodexPacedError(83500*time.Millisecond, false)})
+
+	// A plain 429 with Retry-After: Codex sleeps until then and retries.
+	body := recorder.Body.Bytes()
+	if recorder.Code != http.StatusTooManyRequests || recorder.Header().Get("Retry-After") != "84" {
+		t.Fatalf("status = %d, Retry-After = %q, body = %s", recorder.Code, recorder.Header().Get("Retry-After"), body)
+	}
+	if gjson.GetBytes(body, "error.type").String() == "usage_limit_reached" || recorder.Header().Get("X-Codex-Primary-Used-Percent") != "" {
+		t.Fatalf("a paced request was answered as a usage limit: %s", body)
+	}
+}
+
+func TestResponsesWriteErrorResponseTellsAnExhaustedRetryTheReset(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	recorder := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(recorder)
+	h := NewOpenAIResponsesAPIHandler(handlers.NewBaseAPIHandlers(&sdkconfig.SDKConfig{}, nil))
+
+	h.WriteErrorResponse(c, &interfaces.ErrorMessage{StatusCode: http.StatusTooManyRequests, Error: coreauth.NewCodexPacedError(3*time.Minute, true)})
+
+	body := recorder.Body.Bytes()
+	if gjson.GetBytes(body, "error.type").String() != "usage_limit_reached" || gjson.GetBytes(body, "error.resets_in_seconds").Int() != 180 {
+		t.Fatalf("status = %d, body = %s; want a usage limit resetting in 180s", recorder.Code, body)
+	}
+}

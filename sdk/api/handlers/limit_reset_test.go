@@ -23,27 +23,27 @@ func TestLimitReset(t *testing.T) {
 		return &interfaces.ErrorMessage{StatusCode: http.StatusTooManyRequests, Error: err}
 	}
 	for _, tt := range []struct {
-		name string
-		msg  *interfaces.ErrorMessage
-		want time.Duration
-		ok   bool
+		name   string
+		msg    *interfaces.ErrorMessage
+		want   time.Duration
+		answer LimitAnswer
 	}{
-		{"cooling credentials name the first reset", tooMany(coreauth.NewModelCooldownError("m", "codex", 90*time.Minute)), 90 * time.Minute, true},
-		{"a reset past six hours waits six", tooMany(coreauth.NewModelCooldownError("m", "codex", 30*time.Hour)), 6 * time.Hour, true},
-		{"a reset already due waits a minute", tooMany(coreauth.NewModelCooldownError("m", "codex", 0)), time.Minute, true},
-		{"a 429 without a reset waits six hours", tooMany(errors.New("rate limited")), 6 * time.Hour, true},
-		{"a Codex body names the reset", tooMany(errors.New(`{"error":{"type":"usage_limit_reached","resets_in_seconds":7200}}`)), 2 * time.Hour, true},
-		{"an error's retry-after names the reset", tooMany(retryAfterTestError{after: 3 * time.Hour}), 3 * time.Hour, true},
-		{"a short retry-after waits a minute", tooMany(retryAfterTestError{after: 20 * time.Second}), time.Minute, true},
-		{"a status from the error counts", &interfaces.ErrorMessage{Error: retryAfterTestError{after: time.Hour}}, time.Hour, true},
-		{"other failures are no limit", &interfaces.ErrorMessage{StatusCode: http.StatusBadGateway, Error: errors.New("bad gateway")}, 0, false},
-		{"a direct response is kept", &interfaces.ErrorMessage{StatusCode: http.StatusTooManyRequests, DirectResponse: true}, 0, false},
-		{"no message is no limit", nil, 0, false},
+		{"cooling credentials name the first reset", tooMany(coreauth.NewModelCooldownError("m", "codex", 90*time.Minute)), 90 * time.Minute, LimitReached},
+		{"a reset past six hours waits six", tooMany(coreauth.NewModelCooldownError("m", "codex", 30*time.Hour)), 6 * time.Hour, LimitReached},
+		{"a reset already due is retried at once", tooMany(coreauth.NewModelCooldownError("m", "codex", 0)), time.Second, RetrySoon},
+		{"a 429 without a reset is left to the client", tooMany(errors.New("rate limited")), 0, NoLimit},
+		{"a Codex body names the reset", tooMany(errors.New(`{"error":{"type":"usage_limit_reached","resets_in_seconds":7200}}`)), 2 * time.Hour, LimitReached},
+		{"an error's retry-after names the reset", tooMany(retryAfterTestError{after: 3 * time.Hour}), 3 * time.Hour, LimitReached},
+		{"a short retry-after is a retry", tooMany(retryAfterTestError{after: 20 * time.Second}), 20 * time.Second, RetrySoon},
+		{"a status from the error counts", &interfaces.ErrorMessage{Error: retryAfterTestError{after: time.Hour}}, time.Hour, LimitReached},
+		{"other failures are no limit", &interfaces.ErrorMessage{StatusCode: http.StatusBadGateway, Error: errors.New("bad gateway")}, 0, NoLimit},
+		{"a direct response is kept", &interfaces.ErrorMessage{StatusCode: http.StatusTooManyRequests, DirectResponse: true}, 0, NoLimit},
+		{"no message is no limit", nil, 0, NoLimit},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
-			got, ok := (&BaseAPIHandler{}).LimitReset(tt.msg, "codex")
-			if ok != tt.ok || got != tt.want {
-				t.Fatalf("LimitReset() = %v, %v; want %v, %v", got, ok, tt.want, tt.ok)
+			got, answer := (&BaseAPIHandler{}).LimitReset(tt.msg, "codex")
+			if answer != tt.answer || got != tt.want {
+				t.Fatalf("LimitReset() = %v, %v; want %v, %v", got, answer, tt.want, tt.answer)
 			}
 		})
 	}
@@ -67,8 +67,8 @@ func TestLimitResetNamesTheProvidersFirstRecovery(t *testing.T) {
 	}
 	h := NewBaseAPIHandlers(&sdkconfig.SDKConfig{}, manager)
 
-	got, ok := h.LimitReset(&interfaces.ErrorMessage{StatusCode: http.StatusTooManyRequests, Error: retryAfterTestError{after: 140 * time.Hour}}, "codex")
-	if !ok || got < 3*time.Hour-time.Minute || got > 3*time.Hour {
-		t.Fatalf("LimitReset() = %v, %v; want about 3h", got, ok)
+	got, answer := h.LimitReset(&interfaces.ErrorMessage{StatusCode: http.StatusTooManyRequests, Error: retryAfterTestError{after: 140 * time.Hour}}, "codex")
+	if answer != LimitReached || got < 3*time.Hour-time.Minute || got > 3*time.Hour {
+		t.Fatalf("LimitReset() = %v, %v; want about 3h", got, answer)
 	}
 }

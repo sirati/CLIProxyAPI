@@ -17,34 +17,45 @@ import (
 // the thread by itself. The proxy names the earliest reset among the
 // provider's credentials, but never one more than six hours out: Codex
 // windows sometimes reset early, so after six hours the client asks again and
-// is told the next six.
+// is told the next six. A reset under a minute away is no limit: the client
+// just retries then, which keeps its turn alive.
 const (
 	maxLimitReset = 6 * time.Hour
 	minLimitReset = time.Minute
 )
 
+// LimitAnswer says how a failed request should be answered.
+type LimitAnswer int
+
+const (
+	// NoLimit leaves the error as it is.
+	NoLimit LimitAnswer = iota
+	// RetrySoon tells the client to retry after the reset.
+	RetrySoon
+	// LimitReached tells the client its usage limit resets then.
+	LimitReached
+)
+
 // LimitReset reports how long a client should wait before it resumes a
-// request that failed because provider's credentials are exhausted.
-func (h *BaseAPIHandler) LimitReset(msg *interfaces.ErrorMessage, provider string) (time.Duration, bool) {
+// request that failed because provider's credentials are exhausted or busy,
+// and whether that wait is a retry or a usage limit.
+func (h *BaseAPIHandler) LimitReset(msg *interfaces.ErrorMessage, provider string) (time.Duration, LimitAnswer) {
 	// A direct response was written on purpose by an in-process component.
 	if msg == nil || msg.DirectResponse {
-		return 0, false
+		return 0, NoLimit
 	}
 	now := time.Now()
-	reset, cooling := coreauth.ModelCooldownResetIn(msg.Error)
+	reset, known := coreauth.ModelCooldownResetIn(msg.Error)
 	status := msg.StatusCode
 	if status <= 0 {
 		status = statusFromError(msg.Error)
 	}
-	if !cooling {
-		if status != http.StatusTooManyRequests {
-			return 0, false
-		}
-		reset = maxLimitReset
+	if !known && status != http.StatusTooManyRequests {
+		return 0, NoLimit
 	}
 	earlier := func(d time.Duration) {
-		if d > 0 && d < reset {
-			reset = d
+		if d > 0 && (!known || d < reset) {
+			reset, known = d, true
 		}
 	}
 
@@ -73,11 +84,18 @@ func (h *BaseAPIHandler) LimitReset(msg *interfaces.ErrorMessage, provider strin
 			}
 		}
 	}
+	// A 429 that names no reset is the client's to retry, as it always was.
+	if !known {
+		return 0, NoLimit
+	}
 	if h != nil && h.AuthManager != nil {
 		if recovery, ok := h.AuthManager.EarliestRecovery(provider, now); ok {
 			earlier(recovery.Sub(now))
 		}
 	}
 
-	return min(max(reset, minLimitReset), maxLimitReset), true
+	if reset < minLimitReset {
+		return max(reset, time.Second), RetrySoon
+	}
+	return min(reset, maxLimitReset), LimitReached
 }

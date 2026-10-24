@@ -1950,6 +1950,9 @@ func resultErrorFromError(err error) *Error {
 // Connection lifecycle is intentionally separate from request_scoped so transport
 // drops do not also stop credential rotation via isRequestInvalidError.
 func shouldSkipCredentialCooldown(err *Error) bool {
+	if isCodexPacedResult(err) {
+		return true
+	}
 	if err != nil && err.Code == ErrorCodeForceCooldown {
 		return false
 	}
