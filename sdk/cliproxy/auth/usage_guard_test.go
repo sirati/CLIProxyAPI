@@ -208,8 +208,8 @@ func TestUsageGuard_MinRemainingHoldsAndReleases(t *testing.T) {
 			if got := selectUsageGuarded(t, manager, provider, model); got != a {
 				t.Fatalf("selected %q, want %s (50%% left is above the minimum)", got, a)
 			}
-			if executor.calls[a] != 1 || executor.calls[b] != 0 {
-				t.Fatalf("calls = %v, want only %s polled", executor.calls, a)
+			if executor.calls[a] != 1 || executor.calls[b] != 1 {
+				t.Fatalf("calls = %v, want both OAuth credentials polled (%s guarded)", executor.calls, a)
 			}
 
 			executor.setRemaining(a, 15)
@@ -276,19 +276,33 @@ func TestUsageGuard_UseOnceRetiresOnWindowReset(t *testing.T) {
 			if !ok {
 				t.Fatal("retiring removed the credential; the login must be kept")
 			}
-			if !auth.Disabled || auth.Metadata["disabled"] != true || auth.Metadata[metadataUseOnceRetired] == nil {
+			if auth.Disabled || auth.Metadata["disabled"] == true || !UseOnceStopped(auth) {
 				t.Fatalf("auth not retired: disabled=%v metadata=%v", auth.Disabled, auth.Metadata)
 			}
 			if got := selectUsageGuarded(t, manager, provider, model); got != b {
 				t.Fatalf("selected %q, want %s (%s retired)", got, b, a)
 			}
 
-			// Retirement is permanent: a later reset does not bring it back.
+			// Enabled credentials remain refreshable while routing is stopped.
+			if _, errRefresh := manager.ForceRefreshAuth(ctx, a); errRefresh != nil {
+				t.Fatalf("refresh stopped credential: %v", errRefresh)
+			}
+			if auth, _ := manager.GetByID(a); !UseOnceStopped(auth) || auth.Disabled {
+				t.Fatal("refresh changed routing stop")
+			}
+			// Resetting cooldown cannot bypass a persistent routing stop.
+			if _, _, errReset := manager.ResetQuota(ctx, a); errReset != nil {
+				t.Fatal(errReset)
+			}
+			if got := selectUsageGuarded(t, manager, provider, model); got != b {
+				t.Fatal("quota reset bypassed stop")
+			}
+			// A later quota-window reset does not bring it back.
 			executor.setRemaining(a, 100)
 			calls := executor.calls[a]
 			manager.checkUsageGuards(ctx, guard)
-			if auth, _ := manager.GetByID(a); !auth.Disabled || executor.calls[a] != calls {
-				t.Fatal("a retired credential was polled or re-enabled")
+			if auth, _ := manager.GetByID(a); auth.Disabled || !UseOnceStopped(auth) || executor.calls[a] != calls+1 {
+				t.Fatal("a stopped credential was not observed or resumed routing")
 			}
 		})
 	}
@@ -329,7 +343,7 @@ func TestUsageGuard_UseOnceReenabledStartsOver(t *testing.T) {
 	manager.checkUsageGuards(ctx, guard)
 	executor.setRemaining("claude-a", 80)
 	manager.checkUsageGuards(ctx, guard)
-	if auth, _ := manager.GetByID("claude-a"); !auth.Disabled {
+	if auth, _ := manager.GetByID("claude-a"); !UseOnceStopped(auth) {
 		t.Fatal("precondition: credential did not retire")
 	}
 
@@ -337,6 +351,8 @@ func TestUsageGuard_UseOnceReenabledStartsOver(t *testing.T) {
 	if errMutate := manager.mutateAuthAvailability(ctx, "claude-a", func(auth *Auth, _ time.Time) bool {
 		auth.Disabled, auth.Status = false, StatusActive
 		auth.Metadata["disabled"] = false
+		delete(auth.Metadata, metadataUseOnceRetired)
+		delete(auth.Metadata, metadataUseOnceLastRemaining)
 		return true
 	}); errMutate != nil {
 		t.Fatal(errMutate)
@@ -355,7 +371,7 @@ func TestUsageGuard_UseOnceReenabledStartsOver(t *testing.T) {
 	}
 	executor.setRemaining("claude-a", 83.5)
 	manager.checkUsageGuards(ctx, guard)
-	if auth, _ := manager.GetByID("claude-a"); !auth.Disabled {
+	if auth, _ := manager.GetByID("claude-a"); !UseOnceStopped(auth) {
 		t.Fatal("did not retire when remaining rose 5.5 points")
 	}
 }

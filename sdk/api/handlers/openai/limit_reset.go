@@ -44,7 +44,7 @@ func (h *OpenAIResponsesAPIHandler) codexLimit(msg *interfaces.ErrorMessage) (co
 	resetsAt := time.Now().Unix() + seconds
 	detail := codexLimitDetail{
 		Type:            "usage_limit_reached",
-		Message:         "Every Codex credential has reached its usage limit.",
+		Message:         "Every Codex credential has reached its usage limit." + coreauth.RecoveryMarker(msg.Error),
 		ResetsAt:        resetsAt,
 		ResetsInSeconds: seconds,
 	}
@@ -82,7 +82,7 @@ func (h *OpenAIResponsesAPIHandler) codexRetry(msg *interfaces.ErrorMessage) (ma
 	detail := map[string]any{
 		"type":    "rate_limit_exceeded",
 		"code":    "rate_limit_exceeded",
-		"message": fmt.Sprintf("The Codex account is pacing requests; retry in %ds.", seconds),
+		"message": fmt.Sprintf("The Codex account is pacing requests; retry in %ds.", seconds) + coreauth.RecoveryMarker(msg.Error),
 	}
 	headers := http.Header{}
 	headers.Set("Content-Type", "application/json")

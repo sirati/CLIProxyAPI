@@ -60,7 +60,14 @@ func TestResponsesWriteErrorResponseKeepsOtherErrors(t *testing.T) {
 }
 
 func TestResponsesWebsocketAnswersAUsageLimit(t *testing.T) {
-	h := NewOpenAIResponsesAPIHandler(handlers.NewBaseAPIHandlers(&sdkconfig.SDKConfig{}, nil))
+	manager := coreauth.NewManager(nil, nil, nil)
+	msg := codexCooldownMessage()
+	msg.Error = manager.TrackRecovery(msg.Error, []string{"codex"}, "gpt-6.1-sol")
+	marker := coreauth.RecoveryMarker(msg.Error)
+	if marker == "" {
+		t.Fatal("missing websocket recovery ticket")
+	}
+	h := NewOpenAIResponsesAPIHandler(handlers.NewBaseAPIHandlers(&sdkconfig.SDKConfig{}, manager))
 	serverErrCh := make(chan error, 1)
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		conn, err := responsesWebsocketUpgrader.Upgrade(w, r, nil)
@@ -68,7 +75,7 @@ func TestResponsesWebsocketAnswersAUsageLimit(t *testing.T) {
 			serverErrCh <- err
 			return
 		}
-		_, _, errWrite := h.writeResponsesWebsocketTerminalError(newResponsesWebsocketWriter(conn), nil, codexCooldownMessage(), nil)
+		_, _, errWrite := h.writeResponsesWebsocketTerminalError(newResponsesWebsocketWriter(conn), nil, msg, nil)
 		if !errors.Is(errWrite, websocket.ErrCloseSent) {
 			serverErrCh <- errWrite
 			return
@@ -97,6 +104,9 @@ func TestResponsesWebsocketAnswersAUsageLimit(t *testing.T) {
 	}
 	if gjson.GetBytes(payload, "error.type").String() != "usage_limit_reached" {
 		t.Fatalf("payload = %s", payload)
+	}
+	if !strings.Contains(gjson.GetBytes(payload, "error.message").String(), marker) {
+		t.Fatalf("websocket lost marker: %s", payload)
 	}
 	resetsAt := strconv.FormatInt(gjson.GetBytes(payload, "error.resets_at").Int(), 10)
 	if gjson.GetBytes(payload, "headers.X-Codex-Primary-Used-Percent").String() != "100" ||
@@ -134,5 +144,26 @@ func TestResponsesWriteErrorResponseTellsAnExhaustedRetryTheReset(t *testing.T) 
 	body := recorder.Body.Bytes()
 	if gjson.GetBytes(body, "error.type").String() != "usage_limit_reached" || gjson.GetBytes(body, "error.resets_in_seconds").Int() != 180 {
 		t.Fatalf("status = %d, body = %s; want a usage limit resetting in 180s", recorder.Code, body)
+	}
+}
+
+func TestResponsesLimitPreservesRecoveryMarker(t *testing.T) {
+	manager := coreauth.NewManager(nil, nil, nil)
+	msg := codexCooldownMessage()
+	msg.Error = manager.TrackRecovery(msg.Error, []string{"codex"}, "gpt-6.1-sol")
+	marker := coreauth.RecoveryMarker(msg.Error)
+	if marker == "" {
+		t.Fatal("missing recovery ticket")
+	}
+	h := NewOpenAIResponsesAPIHandler(handlers.NewBaseAPIHandlers(&sdkconfig.SDKConfig{}, manager))
+	detail, _, ok := h.codexLimit(msg)
+	if !ok || !strings.Contains(detail.Message, marker) {
+		t.Fatalf("marker lost from quota response: %+v", detail)
+	}
+	recorder := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(recorder)
+	h.WriteErrorResponse(c, msg)
+	if !strings.Contains(gjson.GetBytes(recorder.Body.Bytes(), "error.message").String(), marker) {
+		t.Fatalf("marker lost from HTTP: %s", recorder.Body.String())
 	}
 }

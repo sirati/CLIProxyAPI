@@ -678,6 +678,12 @@ func (h *Handler) buildAuthFileEntryLocked(auth *coreauth.Auth, quota authFileQu
 		"size":           int64(0),
 	}
 	entry["success"] = auth.Success
+	if quota.v8 {
+		entry["use_once"] = auth.Metadata[coreauth.MetadataUseOnce]
+		entry["min_remaining"] = auth.Metadata[coreauth.MetadataMinRemaining]
+		entry["use_once_target"] = auth.Metadata[coreauth.MetadataUseOnceTarget]
+		entry["routing_stopped"] = coreauth.UseOnceStopped(auth)
+	}
 	entry["failed"] = auth.Failed
 	entry["recent_requests"] = auth.RecentRequestsSnapshot(time.Now())
 	entry["quota"] = quotaObservationPayloadForProvider(auth.Provider, auth.Quota)

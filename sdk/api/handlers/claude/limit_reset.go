@@ -10,6 +10,7 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/interfaces"
 	"github.com/router-for-me/CLIProxyAPI/v8/sdk/api/handlers"
+	coreauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
 )
 
 // claudeLimitError is a Claude error body. Its field order is part of the
@@ -42,7 +43,7 @@ func (h *ClaudeCodeAPIHandler) writeLimitResponse(c *gin.Context, msg *interface
 	hours, minutes, seconds := int(reset.Hours()), int(reset.Minutes())%60, int(reset.Seconds())%60
 	body, _ := json.Marshal(claudeLimitError{Type: "error", Error: claudeLimitErrorDetail{
 		Type:    "rate_limit_error",
-		Message: fmt.Sprintf("[cliproxy] [429]: %s (reset after %dh %dm %ds)", upstream, hours, minutes, seconds),
+		Message: fmt.Sprintf("[cliproxy] [429]: %s (reset after %dh %dm %ds)", upstream, hours, minutes, seconds) + coreauth.RecoveryMarker(msg.Error),
 	}})
 
 	appendClaudeAPIResponse(c, body)

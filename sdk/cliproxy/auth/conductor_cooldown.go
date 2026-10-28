@@ -897,6 +897,7 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 	var authSnapshot *Auth
 	cooldownStateChanged := false
 	scheduleUnauthorizedRefresh := false
+	codexUsageResetObserved := false
 	now := time.Now()
 
 	releaseMutation := m.lockAuthMutation(result.AuthID)
@@ -1332,8 +1333,16 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 		auth.Generation++
 		auth.UpdatedAt = now
 
+		if claudeSubscriptionBlocked(auth) {
+			if auth.Metadata == nil {
+				auth.Metadata = make(map[string]any)
+			}
+			auth.Metadata[metadataUsagePollingBlocked] = claudeOrganizationOAuthBlocked
+		}
 		if !result.SkipQuotaObservation {
+			previousSignals := auth.Quota.Signals
 			auth.Quota.ObserveResponseHeadersForProvider(result.Provider, responseHeaders, now)
+			codexUsageResetObserved = result.Provider == "codex" && codexUsageReset(previousSignals, auth.Quota.Signals)
 			if modelState != nil {
 				modelState.Quota.ObserveResponseHeadersForProvider(result.Provider, responseHeaders, now)
 			}
@@ -1348,6 +1357,9 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 	}
 	m.mu.Unlock()
 	releaseMutation()
+	if codexUsageResetObserved {
+		m.wakeCodexUsagePeers(result.AuthID)
+	}
 	if m.scheduler != nil && authSnapshot != nil {
 		credentialScopedResult := result.CredentialScope || scheduleUnauthorizedRefresh
 		var targetModels []string

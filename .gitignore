@@ -30,6 +30,7 @@ auths/*
 
 # Documentation
 docs/*
+!docs/recovery-notifications.md
 !docs/management-api-v8.md
 AGENTS.md
 CLAUDE.md

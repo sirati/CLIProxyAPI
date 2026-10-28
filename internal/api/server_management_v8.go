@@ -30,6 +30,7 @@ func (s *Server) registerManagementV8Routes() {
 	v8.GET("/server/latest-version", s.mgmt.GetLatestVersion)
 	v8.POST("/requests/api-call", s.mgmt.APICall)
 	v8.POST("/routing/cooldown/reset", s.mgmt.ResetQuota)
+	v8.GET("/routing/recovery/:id", s.mgmt.GetRecovery)
 	v8.GET("/routing/model-definitions/:channel", s.mgmt.GetStaticModelDefinitions)
 
 	v8.GET("/observability/logs", s.mgmt.GetLogs)
@@ -48,6 +49,7 @@ func (s *Server) registerManagementV8Routes() {
 	v8.PATCH("/credentials/status", s.mgmt.PatchAuthFileStatus)
 	v8.PATCH("/credentials/fields", s.mgmt.PatchAuthFileFields)
 	v8.POST("/credentials/refresh", s.mgmt.RefreshAuthFiles)
+	v8.POST("/credentials/use-once", s.mgmt.StartUseOnce)
 	v8.POST("/oauth/import", s.mgmt.ImportOAuthV8)
 	v8.GET("/oauth/auth-url", s.mgmt.StartOAuthV8)
 	v8.POST("/oauth/siwc/bind", s.mgmt.StartSIWCBind)

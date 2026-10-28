@@ -91,6 +91,8 @@ func TestManagementV8IndependentContract(t *testing.T) {
 		"GET /v8/management/credentials", "POST /v8/management/credentials",
 		"GET /v8/management/oauth/auth-url", "POST /v8/management/oauth/import", "POST /v8/management/oauth/callback",
 		"POST /v8/management/routing/cooldown/reset",
+		"POST /v8/management/credentials/use-once",
+		"GET /v8/management/routing/recovery/:id",
 		"GET /v8/management/plugins/:id/quota", "POST /v8/management/plugins/:id/quota", "DELETE /v8/management/plugins/:id/quota",
 		"POST /v8/management/plugins/store/:id/install", "DELETE /v8/management/plugins/:id",
 	} {
@@ -216,5 +218,24 @@ func TestManagementV8PluginOperationMigratesConfiguration(t *testing.T) {
 		}
 	case <-time.After(5 * time.Second):
 		t.Fatal("missing configuration reload")
+	}
+}
+
+func TestRecoveryAndUseOnceRequireManagementAuthentication(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	cfg := &config.Config{Routing: config.RoutingConfig{RecoveryNotifications: true}, RemoteManagement: config.RemoteManagement{SecretKey: "test-password"}}
+	h := management.NewHandlerWithoutConfigFilePath(cfg, nil)
+	h.SetLocalPassword("test-password")
+	s := &Server{cfg: cfg, engine: gin.New(), mgmt: h}
+	s.managementRoutesEnabled.Store(true)
+	s.registerManagementRoutes()
+	for _, route := range []struct{ method, path string }{{"GET", "/v8/management/routing/recovery/test-id"}, {"POST", "/v8/management/credentials/use-once"}} {
+		request := httptest.NewRequest(route.method, route.path, nil)
+		request.RemoteAddr = "127.0.0.1:1234"
+		recorder := httptest.NewRecorder()
+		s.engine.ServeHTTP(recorder, request)
+		if recorder.Code != http.StatusUnauthorized {
+			t.Fatalf("%s authentication: %d %s", route.path, recorder.Code, recorder.Body.String())
+		}
 	}
 }

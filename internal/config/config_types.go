@@ -415,6 +415,8 @@ type QuotaExceeded struct {
 
 // RoutingConfig configures how credentials are selected for requests.
 type RoutingConfig struct {
+	// RecoveryNotifications adds opaque recovery IDs to unavailable-route errors.
+	RecoveryNotifications bool `yaml:"recovery-notifications,omitempty" json:"recovery-notifications,omitempty"`
 	// Strategy selects the credential selection strategy.
 	// Supported values: "round-robin" (default), "weighted-round-robin", "fill-first".
 	Strategy string `yaml:"strategy,omitempty" json:"strategy,omitempty"`

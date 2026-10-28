@@ -232,7 +232,8 @@ type Manager struct {
 	refreshJobs map[string]*authRefreshJob
 
 	// usageGuard polls Claude usage for credentials with use_once or min_remaining set.
-	usageGuard *usageGuard
+	usageGuard      *usageGuard
+	recoveryTickets map[string]recoveryTicket // protected by mu; bounded and process-local
 
 	requestPrepareLocks sync.Map
 	// refreshLocks serializes credential refresh per auth ID so concurrent

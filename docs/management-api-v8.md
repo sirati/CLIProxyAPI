@@ -246,3 +246,25 @@ accepts legacy, new, or mixed layouts, normalizing v8 documents on save.
 
 Plugin OAuth uses the shared v8 login endpoint. Other plugin-defined HTTP
 extensions retain their declared `/v0/management` routes.
+
+## Credential routing stops and recovery notifications
+
+See [Provider recovery notifications](recovery-notifications.md) for opt-in CLI error IDs and `GET /v8/management/routing/recovery/:id`, including its `?watch=true` event subscription.
+
+Use Once keeps a credential enabled for refresh and usage observation after it stops request routing. The v8 credential listing exposes `use_once`, `min_remaining`, `use_once_target`, and `routing_stopped`. The persistent `use_once_retired` metadata marker blocks model selection across process restarts; resetting quota or reaching a new quota window does not remove it.
+
+`POST /v8/management/credentials/use-once` accepts `name`, optional `auth_index`, and optional numeric `target` from 0 to 100. It starts another run, clears the previous stop and baseline, and enables the credential. Omitting `target` uses the saved `min_remaining`; an explicit `target: 0` drains the window without changing that saved minimum. Upstream cooldowns remain in effect. This operation supports Claude and Codex auth-file credentials.
+
+```json
+{"name":"claude.json","auth_index":"optional-index","target":0}
+```
+
+The response is `{"status":"ok","disabled":false}`. A bad target or unsupported provider returns 400; an unknown credential returns 404. Existing credentials disabled by older Use Once versions can be restarted with this operation. Manually disabling a credential still disables its normal credential lifecycle.
+
+### Automatic usage recovery
+
+Enabled Claude and Codex OAuth credentials without usage guards are checked every 15 minutes. Credentials with `use_once` or a positive `min_remaining` stay on a five-minute schedule. A replenishment seen in a Codex usage response or normal response headers triggers an immediate usage check of its other enabled OAuth credentials, even if their next check is not due. A sweep checks each credential at most once.
+
+Fresh successful usage responses can release upstream quota cooldowns before their stored deadlines. Both base usage windows must show quota remaining. Incomplete responses, rate-limit responses, newer failures, permanent authentication failures, independent model cooldowns, and Use Once routing stops do not get cleared by these checks.
+
+Claude's `oauth_not_allowed_for_organization` error stops automatic usage polling and persists `usage_polling_blocked: "oauth_not_allowed_for_organization"` in the auth file. Generic 429s do not set this stop. After renewing the subscription, replace or reauthenticate the credential and remove this field using the credential fields API. Any still-recorded organization-access rejection must also be cleared before automatic polling resumes. Manual status requests remain available.

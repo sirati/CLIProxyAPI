@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -40,8 +41,22 @@ func (exhaustedClaudeUsageExecutor) HttpRequest(context.Context, *cliproxyauth.A
 	return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader(body))}, nil
 }
 
-// A retired use_once credential is written to its auth file as disabled, keeps
-// its tokens, and loads disabled after a restart.
+type stoppedCredentialStore struct {
+	cliproxyauth.Store
+	stopped chan struct{}
+	once    sync.Once
+}
+
+func (s *stoppedCredentialStore) Save(ctx context.Context, auth *cliproxyauth.Auth) (string, error) {
+	path, err := s.Store.Save(ctx, auth)
+	if err == nil && cliproxyauth.UseOnceStopped(auth) {
+		s.once.Do(func() { close(s.stopped) })
+	}
+	return path, err
+}
+
+// A retired use_once credential is written to its auth file as stopped, keeps
+// its tokens, and loads enabled but stopped after a restart.
 func TestUseOnceRetirementPersistsToAuthFile(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "claude-once.json")
@@ -56,7 +71,8 @@ func TestUseOnceRetirementPersistsToAuthFile(t *testing.T) {
 		t.Fatalf("List() = %d auths, %v", len(loaded), err)
 	}
 
-	manager := cliproxyauth.NewManager(store, nil, nil)
+	observer := &stoppedCredentialStore{Store: store, stopped: make(chan struct{})}
+	manager := cliproxyauth.NewManager(observer, nil, nil)
 	manager.RegisterExecutor(exhaustedClaudeUsageExecutor{})
 	if _, err := manager.Register(context.Background(), loaded[0]); err != nil {
 		t.Fatal(err)
@@ -66,24 +82,26 @@ func TestUseOnceRetirementPersistsToAuthFile(t *testing.T) {
 	manager.StartUsageGuard(ctx)
 	defer manager.StopUsageGuard()
 
-	var saved map[string]any
-	deadline := time.Now().Add(5 * time.Second)
-	for {
-		data, errRead := os.ReadFile(path)
-		if errRead == nil && json.Unmarshal(data, &saved) == nil && saved["disabled"] == true {
-			break
-		}
-		if time.Now().After(deadline) {
-			t.Fatalf("auth file never marked disabled: %s", data)
-		}
-		time.Sleep(20 * time.Millisecond)
+	select {
+	case <-observer.stopped:
+	case <-time.After(5 * time.Second):
+		t.Fatal("auth file never marked stopped")
 	}
+	data, errRead := os.ReadFile(path)
+	var saved map[string]any
+	if errRead != nil || json.Unmarshal(data, &saved) != nil {
+		t.Fatalf("read stopped credential: %s, %v", data, errRead)
+	}
+	if saved["disabled"] == true {
+		t.Fatal("stopped credential persisted as disabled")
+	}
+
 	if saved["refresh_token"] != "rt" || saved["use_once_retired"] == nil {
 		t.Fatalf("auth file lost its login or the retire reason: %v", saved)
 	}
 
 	reloaded, err := store.List(context.Background())
-	if err != nil || len(reloaded) != 1 || !reloaded[0].Disabled {
+	if err != nil || len(reloaded) != 1 || reloaded[0].Disabled || !cliproxyauth.UseOnceStopped(reloaded[0]) {
 		t.Fatalf("after restart: %d auths, disabled=%v, err=%v", len(reloaded), len(reloaded) == 1 && reloaded[0].Disabled, err)
 	}
 }

@@ -4,8 +4,6 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"io"
-	"net/http"
 	"strconv"
 	"strings"
 	"sync"
@@ -23,11 +21,13 @@ const (
 	// that must stay unused. Below it the credential is not used until a later
 	// check finds it above again.
 	MetadataMinRemaining = "min_remaining"
-	// MetadataUseOnce retires the credential for good (disabled, login kept)
-	// once its weekly window is empty or below MetadataMinRemaining, or once
+	// MetadataUseOnce stops routing to the credential (enabled, login kept)
+	// once its weekly window is empty or reaches MetadataMinRemaining, or once
 	// the window resets: the weekly remainder rose more than useOnceResetRise
 	// points since the previous check. It drains one window's quota, then stops.
 	MetadataUseOnce = "use_once"
+	// MetadataUseOnceTarget overrides the saved minimum for the current run.
+	MetadataUseOnceTarget = "use_once_target"
 
 	// metadataUseOnceLastRemaining is the weekly remainder, in percent, at the
 	// previous check. It is kept in the auth file across restarts.
@@ -40,9 +40,9 @@ const (
 )
 
 const (
-	usageGuardInterval     = 5 * time.Minute
-	usageGuardFetchTimeout = 30 * time.Second
-	useOnceResetRise       = 5.0
+	usageGuardInterval    = 5 * time.Minute
+	usageRecoveryInterval = 15 * time.Minute
+	useOnceResetRise      = 5.0
 
 	claudeUsageURL = "https://api.anthropic.com/api/oauth/usage"
 	codexUsageURL  = "https://chatgpt.com/backend-api/wham/usage"
@@ -62,7 +62,7 @@ type usageGuardSettings struct {
 	useOnce          bool
 	lastRemaining    float64
 	hasLastRemaining bool
-	// retired is set when a use_once credential retired and was re-enabled since.
+	// retired keeps the credential out of routing until explicitly restarted.
 	retired bool
 }
 
@@ -75,14 +75,21 @@ func usageGuardSettingsOf(auth *Auth) (usageGuardSettings, bool) {
 	settings.useOnce, _ = metadataBool(auth.Metadata[MetadataUseOnce])
 	settings.lastRemaining, settings.hasLastRemaining = metadataNumber(auth.Metadata[metadataUseOnceLastRemaining])
 	_, settings.retired = auth.Metadata[metadataUseOnceRetired]
-	if settings.retired {
-		// Re-enabled after retiring: start over from the current remainder.
-		settings.hasLastRemaining = false
+	if settings.useOnce {
+		if target, ok := metadataNumber(auth.Metadata[MetadataUseOnceTarget]); ok {
+			settings.minRemaining, settings.hasMinRemaining = target, target > 0
+		}
 	}
 	if settings.hasMinRemaining && settings.minRemaining <= 0 {
 		settings.hasMinRemaining = false
 	}
 	return settings, settings.useOnce || settings.hasMinRemaining
+}
+
+// UseOnceStopped reports a persistent routing stop, independently of login status.
+func UseOnceStopped(auth *Auth) bool {
+	settings, _ := usageGuardSettingsOf(auth)
+	return settings.useOnce && settings.retired
 }
 
 type usageGuardAction int
@@ -106,7 +113,7 @@ type usageGuardDecision struct {
 // weekly window that is left, in percent (0-100).
 func decideUsageGuard(settings usageGuardSettings, remaining float64) usageGuardDecision {
 	var decision usageGuardDecision
-	belowMinimum := settings.hasMinRemaining && remaining < settings.minRemaining
+	belowMinimum := settings.hasMinRemaining && (remaining < settings.minRemaining || (settings.useOnce && remaining == settings.minRemaining))
 	if !settings.useOnce {
 		if belowMinimum {
 			decision.action = usageGuardHold
@@ -205,11 +212,14 @@ type usageGuard struct {
 	mu sync.Mutex
 	// holds maps auth ID to the recovery time of the hold this guard set, so a
 	// release never clears a cooldown that came from an upstream 429.
-	holds map[string]time.Time
+	holds      map[string]time.Time
+	lastChecks map[string]time.Time
+	codexUsage map[string]map[string]string
+	wake       chan string
 }
 
-// StartUsageGuard polls the provider's usage endpoint every five minutes for each
-// credential with use_once or min_remaining set, and holds or retires it.
+// StartUsageGuard checks guarded credentials every five minutes and other OAuth
+// credentials every fifteen minutes, revalidating upstream quota cooldowns.
 func (m *Manager) StartUsageGuard(parent context.Context) {
 	if m == nil {
 		return
@@ -218,7 +228,7 @@ func (m *Manager) StartUsageGuard(parent context.Context) {
 		parent = context.Background()
 	}
 	ctx, cancel := context.WithCancel(parent)
-	guard := &usageGuard{cancel: cancel, holds: make(map[string]time.Time)}
+	guard := &usageGuard{cancel: cancel, holds: make(map[string]time.Time), wake: make(chan string, 1)}
 	m.mu.Lock()
 	previous := m.usageGuard
 	m.usageGuard = guard
@@ -229,12 +239,15 @@ func (m *Manager) StartUsageGuard(parent context.Context) {
 	go func() {
 		ticker := time.NewTicker(usageGuardInterval)
 		defer ticker.Stop()
+		m.pollUsageGuards(ctx, guard, time.Now(), false, "", false)
 		for {
-			m.checkUsageGuards(ctx, guard)
 			select {
 			case <-ctx.Done():
 				return
-			case <-ticker.C:
+			case now := <-ticker.C:
+				m.pollUsageGuards(ctx, guard, now, false, "", false)
+			case source := <-guard.wake:
+				m.pollUsageGuards(ctx, guard, time.Now(), true, source, false)
 			}
 		}
 	}()
@@ -255,42 +268,85 @@ func (m *Manager) StopUsageGuard() {
 }
 
 func (m *Manager) checkUsageGuards(ctx context.Context, guard *usageGuard) {
-	for _, auth := range m.List() {
-		if ctx.Err() != nil {
-			return
-		}
-		if auth.Disabled || auth.Status == StatusDisabled {
-			guard.forget(auth.ID)
-			continue
-		}
+	m.pollUsageGuards(ctx, guard, time.Now(), false, "", true)
+}
+
+func (m *Manager) pollUsageGuards(ctx context.Context, guard *usageGuard, now time.Time, forceCodex bool, source string, forceAll bool) {
+	checked := make(map[string]bool)
+	reset := false
+	check := func(auth *Auth) {
+		checked[auth.ID] = true
+		guard.recordUsageCheck(auth.ID, now)
 		settings, enabled := usageGuardSettingsOf(auth)
 		if !enabled {
 			if until, held := guard.held(auth.ID); held {
 				m.releaseUsageHold(ctx, guard, auth.ID, until)
+				if current, ok := m.GetByID(auth.ID); ok {
+					auth = current
+				}
 			}
+		}
+		if m.checkUsageGuard(ctx, guard, auth, settings) {
+			reset = true
+		}
+	}
+	for _, auth := range m.List() {
+		if ctx.Err() != nil {
+			return
+		}
+		if claudeSubscriptionBlocked(auth) && auth.Metadata[metadataUsagePollingBlocked] == nil {
+			m.blockAutomaticUsage(ctx, auth.ID)
+		}
+		if !automaticUsageEligible(auth) {
 			continue
 		}
-		m.checkUsageGuard(ctx, guard, auth, settings)
+		if auth.ID == source {
+			continue
+		}
+		due := guard.usageCheckDue(auth, now)
+		if forceCodex {
+			due = strings.EqualFold(auth.Provider, "codex")
+		}
+		if forceAll || due {
+			check(auth)
+		}
+	}
+	if reset {
+		// A reset seen by this sweep also checks peers whose normal poll is not due.
+		// Already checked peers have fresh observations and are not fetched twice.
+		for _, auth := range m.List() {
+			if ctx.Err() != nil {
+				return
+			}
+			if auth.Provider == "codex" && !checked[auth.ID] && auth.ID != source && automaticUsageEligible(auth) {
+				check(auth)
+			}
+		}
 	}
 }
 
-func (m *Manager) checkUsageGuard(ctx context.Context, guard *usageGuard, auth *Auth, settings usageGuardSettings) {
-	weeklyUsed, errFetch := m.fetchWeeklyUsage(ctx, auth)
+func (m *Manager) checkUsageGuard(ctx context.Context, guard *usageGuard, auth *Auth, settings usageGuardSettings) bool {
+	observation, errFetch := m.fetchUsageObservation(ctx, auth)
 	if errFetch != nil {
+		if blockedUsageError(auth.Provider, errFetch) {
+			m.blockAutomaticUsage(ctx, auth.ID)
+		}
 		log.Warnf("usage guard: %s: %v", auth.ID, errFetch)
 		// Unknown usage must not lift a hold: keep it until a check succeeds.
 		if _, held := guard.held(auth.ID); held {
 			m.applyUsageHold(ctx, guard, auth.ID, "usage check failed, keeping the hold")
 		}
-		return
+		return false
 	}
-	remaining := 100 - weeklyUsed
+	reset := guard.observeCodexUsage(auth, observation.signals)
+	m.applyUsageObservation(ctx, auth, observation)
+	remaining := 100 - observation.weeklyUsed
+	if settings.useOnce && settings.retired {
+		return reset // Keep observing usage without restarting request routing.
+	}
 	decision := decideUsageGuard(settings, remaining)
 	if decision.setLastRemaining {
 		m.setUsageGuardMetadata(ctx, auth.ID, metadataUseOnceLastRemaining, decision.lastRemaining)
-	}
-	if settings.retired {
-		m.deleteUsageGuardMetadata(ctx, auth.ID, metadataUseOnceRetired)
 	}
 	if _, stale := auth.Metadata[metadataUseOnceOldBaseline]; stale {
 		m.deleteUsageGuardMetadata(ctx, auth.ID, metadataUseOnceOldBaseline)
@@ -309,53 +365,13 @@ func (m *Manager) checkUsageGuard(ctx context.Context, guard *usageGuard, auth *
 			m.releaseUsageHold(ctx, guard, auth.ID, until)
 		}
 	}
-}
-
-// fetchWeeklyUsage asks the credential's provider for its weekly usage in
-// percent. The request goes through the provider executor, which adds the
-// credential's token.
-func (m *Manager) fetchWeeklyUsage(ctx context.Context, auth *Auth) (float64, error) {
-	reqCtx, cancel := context.WithTimeout(ctx, usageGuardFetchTimeout)
-	defer cancel()
-	isCodex := strings.EqualFold(strings.TrimSpace(auth.Provider), "codex")
-	usageURL, parse := claudeUsageURL, parseClaudeWeeklyUsage
-	if isCodex {
-		usageURL, parse = codexUsageURL, parseCodexWeeklyUsage
-	}
-	req, errReq := http.NewRequestWithContext(reqCtx, http.MethodGet, usageURL, nil)
-	if errReq != nil {
-		return 0, errReq
-	}
-	req.Header.Set("Accept", "application/json")
-	req.Header.Set("Content-Type", "application/json")
-	if isCodex {
-		req.Header.Set("User-Agent", codexUsageUserAgent)
-		req.Header.Set("Originator", "codex-tui")
-		if accountID, ok := auth.Metadata["account_id"].(string); ok && strings.TrimSpace(accountID) != "" {
-			req.Header.Set("Chatgpt-Account-Id", accountID)
-		}
-	} else {
-		req.Header.Set("Anthropic-Beta", "oauth-2025-04-20")
-		req.Header.Set("User-Agent", "claude-cli/2.1.280 (external, cli)")
-	}
-	resp, errDo := m.HttpRequest(reqCtx, auth, req)
-	if errDo != nil {
-		return 0, errDo
-	}
-	defer func() { _ = resp.Body.Close() }()
-	body, errRead := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
-	if errRead != nil {
-		return 0, errRead
-	}
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return 0, fmt.Errorf("usage endpoint returned HTTP %d", resp.StatusCode)
-	}
-	return parse(body)
+	return reset
 }
 
 func (m *Manager) applyUsageHold(ctx context.Context, guard *usageGuard, authID, reason string) {
-	until := time.Now().Add(usageGuardInterval + time.Minute)
-	errMutate := m.mutateAuthAvailability(ctx, authID, func(auth *Auth, _ time.Time) bool {
+	var until time.Time
+	errMutate := m.mutateAuthAvailability(ctx, authID, func(auth *Auth, now time.Time) bool {
+		until = now.Add(credentialUsageInterval(auth) + time.Minute)
 		applyCooldownFields(&auth.Quota, QuotaState{
 			Exceeded:      true,
 			Reason:        "credential_quota",
@@ -396,16 +412,16 @@ func (m *Manager) releaseUsageHold(ctx context.Context, guard *usageGuard, authI
 }
 
 func (m *Manager) retireUseOnce(ctx context.Context, guard *usageGuard, authID, reason string) {
+	if until, held := guard.held(authID); held {
+		m.releaseUsageHold(ctx, guard, authID, until)
+	}
 	guard.forget(authID)
 	now := time.Now()
 	errMutate := m.mutateAuthAvailability(ctx, authID, func(auth *Auth, _ time.Time) bool {
-		auth.Disabled = true
-		auth.Status = StatusDisabled
 		auth.StatusMessage = "use once: " + reason
 		if auth.Metadata == nil {
 			auth.Metadata = make(map[string]any)
 		}
-		auth.Metadata["disabled"] = true
 		auth.Metadata[metadataUseOnceRetired] = now.UTC().Format(time.RFC3339) + " " + reason
 		return true
 	})
@@ -413,7 +429,7 @@ func (m *Manager) retireUseOnce(ctx context.Context, guard *usageGuard, authID, 
 		log.Warnf("usage guard: retiring %s: %v", authID, errMutate)
 		return
 	}
-	log.Infof("usage guard: retired use-once credential %s: %s (login kept, re-enable to use again)", authID, reason)
+	log.Infof("usage guard: stopped routing to use-once credential %s: %s (login enabled)", authID, reason)
 }
 
 func (m *Manager) setUsageGuardMetadata(ctx context.Context, authID, key string, value any) {
