@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"strconv"
 	"strings"
 	"time"
@@ -14,8 +15,21 @@ import (
 	"github.com/tidwall/gjson"
 )
 
-const metadataUsagePollingBlocked = "usage_polling_blocked"
-const claudeOrganizationOAuthBlocked = "oauth_not_allowed_for_organization"
+const (
+	// metadataUsagePollingBlocked marks a Claude login whose subscription has
+	// lapsed. The key predates the routing stop and is kept for existing files.
+	metadataUsagePollingBlocked = "usage_polling_blocked"
+	// metadataSubscriptionCheckedAt is when a lapsed subscription was last
+	// confirmed or probed, so restarts keep the slow probe schedule.
+	metadataSubscriptionCheckedAt = "subscription_checked_at"
+
+	claudeOrganizationOAuthBlocked = "oauth_not_allowed_for_organization"
+	claudeOrganizationOAuthMessage = "OAuth authentication is currently not allowed for this organization."
+
+	// lapsedSubscriptionInterval spaces usage probes of lapsed subscriptions.
+	// Probing them often only earns rate limits.
+	lapsedSubscriptionInterval = 6 * time.Hour
+)
 
 type usageObservation struct {
 	weeklyUsed float64
@@ -36,36 +50,79 @@ func (e *usageEndpointError) Error() string {
 }
 
 func credentialUsageInterval(auth *Auth) time.Duration {
+	if ClaudeSubscriptionLapsed(auth) {
+		return lapsedSubscriptionInterval
+	}
 	if _, guarded := usageGuardSettingsOf(auth); guarded {
 		return usageGuardInterval
 	}
 	return usageRecoveryInterval
 }
 
-func claudeSubscriptionBlocked(auth *Auth) bool {
-	if auth == nil || !strings.EqualFold(auth.Provider, "claude") {
+// ClaudeSubscriptionLapsed reports a Claude login whose subscription has
+// lapsed. The credential stays enabled for refresh and usage checks, but no
+// request is routed to it until a usage check or a request succeeds again.
+func ClaudeSubscriptionLapsed(auth *Auth) bool {
+	return auth != nil && strings.EqualFold(auth.Provider, "claude") && auth.Metadata[metadataUsagePollingBlocked] == claudeOrganizationOAuthBlocked
+}
+
+// RoutingStopped reports an enabled credential that must not receive requests.
+func RoutingStopped(auth *Auth) bool {
+	return UseOnceStopped(auth) || ClaudeSubscriptionLapsed(auth)
+}
+
+func claudeSubscriptionLapseText(text string) bool {
+	return strings.Contains(text, claudeOrganizationOAuthBlocked) || strings.Contains(text, claudeOrganizationOAuthMessage)
+}
+
+func isClaudeSubscriptionLapseError(provider string, err *Error) bool {
+	return strings.EqualFold(provider, "claude") && err != nil && claudeSubscriptionLapseText(err.Message)
+}
+
+func markClaudeSubscriptionLapsed(auth *Auth, now time.Time) {
+	if auth.Metadata == nil {
+		auth.Metadata = make(map[string]any)
+	}
+	auth.Metadata[metadataUsagePollingBlocked] = claudeOrganizationOAuthBlocked
+	auth.Metadata[metadataSubscriptionCheckedAt] = now.UTC().Format(time.RFC3339)
+}
+
+// clearClaudeSubscriptionLapse lifts the routing stop and the failures the
+// lapse recorded once the subscription works again.
+func clearClaudeSubscriptionLapse(auth *Auth, now time.Time) bool {
+	if !ClaudeSubscriptionLapsed(auth) {
 		return false
 	}
-	if auth.Metadata[metadataUsagePollingBlocked] == claudeOrganizationOAuthBlocked {
-		return true
-	}
-	blocked := func(text string) bool {
-		return strings.Contains(text, claudeOrganizationOAuthBlocked) || strings.Contains(text, "OAuth authentication is currently not allowed for this organization.")
-	}
-	if blocked(auth.StatusMessage) || (auth.LastError != nil && blocked(auth.LastError.Message)) {
-		return true
-	}
+	delete(auth.Metadata, metadataUsagePollingBlocked)
+	delete(auth.Metadata, metadataSubscriptionCheckedAt)
+	reset := false
 	for _, state := range auth.ModelStates {
-		if state != nil && (blocked(state.StatusMessage) || (state.LastError != nil && blocked(state.LastError.Message))) {
-			return true
+		if state != nil && state.LastError != nil && claudeSubscriptionLapseText(state.LastError.Message) {
+			resetModelState(state, now)
+			reset = true
 		}
 	}
-	return false
+	if auth.LastError != nil && claudeSubscriptionLapseText(auth.LastError.Message) {
+		auth.LastError = nil
+		auth.StatusMessage = ""
+		auth.Status = StatusActive
+		reset = true
+	}
+	if reset {
+		updateAggregatedAvailability(auth, now)
+	}
+	return true
+}
+
+func lapsedSubscriptionCheckDue(auth *Auth, now time.Time) bool {
+	raw, _ := auth.Metadata[metadataSubscriptionCheckedAt].(string)
+	checked, err := time.Parse(time.RFC3339, raw)
+	return err != nil || !checked.Add(lapsedSubscriptionInterval).After(now)
 }
 
 func automaticUsageEligible(auth *Auth) bool {
 	return auth != nil && usageGuardProviders[strings.ToLower(auth.Provider)] && !auth.Disabled && auth.Status != StatusDisabled &&
-		auth.AuthKind() != AuthKindAPIKey && !claudeSubscriptionBlocked(auth)
+		auth.AuthKind() != AuthKindAPIKey
 }
 
 func blockedUsageError(provider string, err error) bool {
@@ -73,17 +130,51 @@ func blockedUsageError(provider string, err error) bool {
 	return strings.EqualFold(provider, "claude") && errors.As(err, &endpoint) && endpoint.organizationBlocked
 }
 
-func (m *Manager) blockAutomaticUsage(ctx context.Context, authID string) {
-	err := m.mutateAuthAvailability(ctx, authID, func(auth *Auth, _ time.Time) bool {
-		if auth.Metadata == nil {
-			auth.Metadata = make(map[string]any)
+func (m *Manager) setClaudeSubscriptionLapse(ctx context.Context, authID string, lapsed bool) {
+	err := m.mutateAuthAvailability(ctx, authID, func(auth *Auth, now time.Time) bool {
+		if !lapsed {
+			return clearClaudeSubscriptionLapse(auth, now)
 		}
-		auth.Metadata[metadataUsagePollingBlocked] = claudeOrganizationOAuthBlocked
+		if !strings.EqualFold(auth.Provider, "claude") {
+			return false
+		}
+		markClaudeSubscriptionLapsed(auth, now)
 		return true
 	})
 	if err != nil {
-		log.Warnf("usage guard: persisting polling stop for %s: %v", authID, err)
+		log.Warnf("usage guard: recording subscription state for %s: %v", authID, err)
 	}
+}
+
+// ObserveClaudeUsageCheck records what a Claude usage request made outside the
+// poller, such as the management panel's refresh, says about the subscription.
+func (m *Manager) ObserveClaudeUsageCheck(ctx context.Context, authID string, status int, body []byte) {
+	if m == nil {
+		return
+	}
+	auth, ok := m.GetByID(authID)
+	if !ok || !strings.EqualFold(auth.Provider, "claude") {
+		return
+	}
+	if status == http.StatusForbidden && claudeUsageOrganizationBlocked(body) {
+		m.setClaudeSubscriptionLapse(ctx, authID, true)
+		return
+	}
+	if status >= 200 && status < 300 && ClaudeSubscriptionLapsed(auth) {
+		if _, errParse := parseUsageObservation(auth.Provider, body); errParse == nil {
+			m.setClaudeSubscriptionLapse(ctx, authID, false)
+		}
+	}
+}
+
+// IsClaudeUsageURL reports whether u is the Claude OAuth usage endpoint.
+func IsClaudeUsageURL(u *url.URL) bool {
+	return u != nil && strings.EqualFold(u.Hostname(), "api.anthropic.com") && strings.TrimSuffix(u.Path, "/") == "/api/oauth/usage"
+}
+
+func claudeUsageOrganizationBlocked(body []byte) bool {
+	return gjson.GetBytes(body, "error.details.error_code").String() == claudeOrganizationOAuthBlocked ||
+		gjson.GetBytes(body, "error.message").String() == claudeOrganizationOAuthMessage
 }
 
 func (m *Manager) fetchUsageObservation(ctx context.Context, auth *Auth) (usageObservation, error) {
@@ -122,8 +213,7 @@ func (m *Manager) fetchUsageObservation(ctx context.Context, auth *Auth) (usageO
 		return usageObservation{}, err
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		blocked := !isCodex && resp.StatusCode == http.StatusForbidden && (gjson.GetBytes(body, "error.details.error_code").String() == claudeOrganizationOAuthBlocked ||
-			gjson.GetBytes(body, "error.message").String() == "OAuth authentication is currently not allowed for this organization.")
+		blocked := !isCodex && resp.StatusCode == http.StatusForbidden && claudeUsageOrganizationBlocked(body)
 		return usageObservation{}, &usageEndpointError{status: resp.StatusCode, organizationBlocked: blocked}
 	}
 	return parseUsageObservation(auth.Provider, body)

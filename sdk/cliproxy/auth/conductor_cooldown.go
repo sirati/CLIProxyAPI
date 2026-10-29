@@ -898,6 +898,7 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 	cooldownStateChanged := false
 	scheduleUnauthorizedRefresh := false
 	codexUsageResetObserved := false
+	subscriptionLapseChanged := false
 	now := time.Now()
 
 	releaseMutation := m.lockAuthMutation(result.AuthID)
@@ -1333,11 +1334,13 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 		auth.Generation++
 		auth.UpdatedAt = now
 
-		if claudeSubscriptionBlocked(auth) {
-			if auth.Metadata == nil {
-				auth.Metadata = make(map[string]any)
-			}
-			auth.Metadata[metadataUsagePollingBlocked] = claudeOrganizationOAuthBlocked
+		// A lapsed subscription stops routing on every model, so the scheduler
+		// must re-evaluate the whole credential when it starts or ends.
+		if !result.Success && isClaudeSubscriptionLapseError(auth.Provider, result.Error) {
+			subscriptionLapseChanged = !ClaudeSubscriptionLapsed(auth)
+			markClaudeSubscriptionLapsed(auth, now)
+		} else if result.Success {
+			subscriptionLapseChanged = clearClaudeSubscriptionLapse(auth, now)
 		}
 		if !result.SkipQuotaObservation {
 			previousSignals := auth.Quota.Signals
@@ -1361,7 +1364,7 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 		m.wakeCodexUsagePeers(result.AuthID)
 	}
 	if m.scheduler != nil && authSnapshot != nil {
-		credentialScopedResult := result.CredentialScope || scheduleUnauthorizedRefresh
+		credentialScopedResult := result.CredentialScope || scheduleUnauthorizedRefresh || subscriptionLapseChanged
 		var targetModels []string
 		if !credentialScopedResult && modelKey != "" {
 			targetModels = append(targetModels, modelKey)

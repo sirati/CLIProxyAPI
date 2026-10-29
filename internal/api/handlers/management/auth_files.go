@@ -683,6 +683,7 @@ func (h *Handler) buildAuthFileEntryLocked(auth *coreauth.Auth, quota authFileQu
 		entry["min_remaining"] = auth.Metadata[coreauth.MetadataMinRemaining]
 		entry["use_once_target"] = auth.Metadata[coreauth.MetadataUseOnceTarget]
 		entry["routing_stopped"] = coreauth.UseOnceStopped(auth)
+		entry["subscription_lapsed"] = coreauth.ClaudeSubscriptionLapsed(auth)
 	}
 	entry["failed"] = auth.Failed
 	entry["recent_requests"] = auth.RecentRequestsSnapshot(time.Now())

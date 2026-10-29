@@ -150,7 +150,7 @@ func TestProviderUsageRequiresFreshCompleteEvidence(t *testing.T) {
 			if !current.Quota.Exceeded {
 				t.Fatal("incomplete or negative observation cleared cooldown")
 			}
-			if claudeSubscriptionBlocked(current) {
+			if ClaudeSubscriptionLapsed(current) {
 				t.Fatal("generic rate limit classified as expired subscription")
 			}
 		})
@@ -187,13 +187,16 @@ func TestProviderUsageRequiresFreshCompleteEvidence(t *testing.T) {
 }
 
 func TestClaudeExpiredSubscriptionStopsAutomaticPolling(t *testing.T) {
-	m, a, _, e, guard := usageRecoveryFixture(t, "claude")
+	m, a, model, e, guard := usageRecoveryFixture(t, "claude")
 	e.statuses[a.ID] = 403
-	e.bodies[a.ID] = `{"error":{"type":"permission_error","message":"OAuth authentication is currently not allowed for this organization.","details":{"error_code":"oauth_not_allowed_for_organization"}}}`
+	e.bodies[a.ID] = lapsedUsageBody
 	m.checkUsageGuards(context.Background(), guard)
 	current, _ := m.GetByID(a.ID)
-	if !claudeSubscriptionBlocked(current) || current.Metadata[metadataUsagePollingBlocked] != claudeOrganizationOAuthBlocked {
-		t.Fatal("subscription failure not recorded")
+	if !ClaudeSubscriptionLapsed(current) || current.Disabled {
+		t.Fatal("subscription failure not recorded as an enabled routing stop")
+	}
+	if _, err := m.SelectAuth(context.Background(), "claude", model, cliproxyexecutor.Options{}); err == nil {
+		t.Fatal("lapsed subscription still routed")
 	}
 	for i := 0; i < 3; i++ {
 		m.checkUsageGuards(context.Background(), guard)
@@ -202,16 +205,25 @@ func TestClaudeExpiredSubscriptionStopsAutomaticPolling(t *testing.T) {
 		t.Fatalf("expired subscription queried again: %v", e.calls)
 	}
 	// A persisted marker also suppresses polling after service restart.
-	restarted, base, newGuard := newUsageGuardManager(t, "claude", "expired-usage-restarted", current)
+	restarted, base, newGuard := newUsageGuardManager(t, "claude", model, current)
 	restarted.checkUsageGuards(context.Background(), newGuard)
 	if base.calls[a.ID] != 0 {
 		t.Fatal("restart lost polling stop")
 	}
-	// An already known model error suppresses the very first probe.
-	delete(current.Metadata, metadataUsagePollingBlocked)
-	current.ModelStates = map[string]*ModelState{"m": {LastError: &Error{HTTPStatus: 403, Message: e.bodies[a.ID]}}}
-	if automaticUsageEligible(current) {
-		t.Fatal("known subscription failure still polled")
+	// The slow probe still runs, and a renewed subscription resumes routing.
+	e.statuses[a.ID] = 200
+	e.bodies[a.ID] = availableUsage("claude")
+	m.pollUsageGuards(context.Background(), guard, time.Now().Add(lapsedSubscriptionInterval-time.Minute), false, "", true)
+	if e.calls[a.ID] != 1 {
+		t.Fatalf("lapsed subscription probed before %s: %v", lapsedSubscriptionInterval, e.calls)
+	}
+	m.pollUsageGuards(context.Background(), guard, time.Now().Add(lapsedSubscriptionInterval+time.Minute), false, "", false)
+	current, _ = m.GetByID(a.ID)
+	if e.calls[a.ID] != 2 || ClaudeSubscriptionLapsed(current) {
+		t.Fatalf("renewed subscription not detected: calls=%v lapsed=%v", e.calls, ClaudeSubscriptionLapsed(current))
+	}
+	if got := selectUsageGuarded(t, m, "claude", model); got != a.ID {
+		t.Fatalf("renewed subscription not routed: %s", got)
 	}
 }
 

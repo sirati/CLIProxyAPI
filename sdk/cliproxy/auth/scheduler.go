@@ -623,8 +623,20 @@ func (s *authScheduler) pickMixedWithStrategy(ctx context.Context, providers []s
 	return nil, "", s.mixedUnavailableErrorLocked(normalized, model, predicate)
 }
 
+// excludeRoutingStopped keeps routing-stopped credentials out of unavailable
+// errors: they have no recovery time and their last error is not the cause.
+func excludeRoutingStopped(predicate func(*scheduledAuth) bool) func(*scheduledAuth) bool {
+	return func(entry *scheduledAuth) bool {
+		if entry != nil && RoutingStopped(entry.auth) {
+			return false
+		}
+		return predicate == nil || predicate(entry)
+	}
+}
+
 // mixedUnavailableErrorLocked synthesizes the mixed-provider cooldown or unavailable error.
 func (s *authScheduler) mixedUnavailableErrorLocked(providers []string, model string, predicate func(*scheduledAuth) bool) error {
+	predicate = excludeRoutingStopped(predicate)
 	now := time.Now()
 	total := 0
 	cooldownCount := 0
@@ -1416,6 +1428,7 @@ func (m *modelScheduler) readyCountAtPriorityLocked(preferWebsocket bool, priori
 
 // unavailableErrorLocked returns the correct unavailable or cooldown error for the shard.
 func (m *modelScheduler) unavailableErrorLocked(provider, model string, predicate func(*scheduledAuth) bool) error {
+	predicate = excludeRoutingStopped(predicate)
 	now := time.Now()
 	total, cooldownCount, unauthorizedCount, earliest := m.availabilitySummaryLocked(predicate)
 	_, _, _, authErr, _, _ := m.candidateErrorsLocked(model, predicate)

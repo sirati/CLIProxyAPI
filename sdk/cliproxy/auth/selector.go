@@ -527,7 +527,15 @@ func getAvailableAuthsWithPriorityMode(auths []*Auth, provider, model string, no
 
 	availableByPriority, cooldownCount, earliest := collectAvailableByPriority(auths, model, now)
 	if len(availableByPriority) == 0 {
-		if cooldownCount == len(auths) && !earliest.IsZero() {
+		// Routing-stopped credentials have no recovery time; the rest decide
+		// whether this is a cooldown.
+		routable := len(auths)
+		for _, candidate := range auths {
+			if RoutingStopped(candidate) {
+				routable--
+			}
+		}
+		if cooldownCount == routable && !earliest.IsZero() {
 			providerForError := provider
 			if providerForError == "mixed" {
 				providerForError = ""
@@ -824,7 +832,7 @@ func isAuthBlockedForModel(auth *Auth, model string, now time.Time) (bool, block
 	if auth == nil {
 		return true, blockReasonOther, time.Time{}
 	}
-	if auth.Disabled || auth.Status == StatusDisabled || UseOnceStopped(auth) {
+	if auth.Disabled || auth.Status == StatusDisabled || RoutingStopped(auth) {
 		return true, blockReasonDisabled, time.Time{}
 	}
 	if hasUnauthorizedAuthFailure(auth) {
@@ -973,7 +981,7 @@ func isAuthBlockedByQuotaOrAuthForModel(auth *Auth, model string, now time.Time)
 	if auth == nil {
 		return true
 	}
-	if auth.Disabled || auth.Status == StatusDisabled || UseOnceStopped(auth) {
+	if auth.Disabled || auth.Status == StatusDisabled || RoutingStopped(auth) {
 		return true
 	}
 	if hasUnauthorizedAuthFailure(auth) {

@@ -294,13 +294,21 @@ func (m *Manager) pollUsageGuards(ctx context.Context, guard *usageGuard, now ti
 		if ctx.Err() != nil {
 			return
 		}
-		if claudeSubscriptionBlocked(auth) && auth.Metadata[metadataUsagePollingBlocked] == nil {
-			m.blockAutomaticUsage(ctx, auth.ID)
-		}
 		if !automaticUsageEligible(auth) {
 			continue
 		}
 		if auth.ID == source {
+			continue
+		}
+		if ClaudeSubscriptionLapsed(auth) {
+			// Probe lapsed subscriptions on their own slow, persisted schedule,
+			// also on restarts and forced sweeps.
+			if lapsedSubscriptionCheckDue(auth, now) {
+				m.setClaudeSubscriptionLapse(ctx, auth.ID, true)
+				if current, ok := m.GetByID(auth.ID); ok {
+					check(current)
+				}
+			}
 			continue
 		}
 		due := guard.usageCheckDue(auth, now)
@@ -328,8 +336,9 @@ func (m *Manager) pollUsageGuards(ctx context.Context, guard *usageGuard, now ti
 func (m *Manager) checkUsageGuard(ctx context.Context, guard *usageGuard, auth *Auth, settings usageGuardSettings) bool {
 	observation, errFetch := m.fetchUsageObservation(ctx, auth)
 	if errFetch != nil {
-		if blockedUsageError(auth.Provider, errFetch) {
-			m.blockAutomaticUsage(ctx, auth.ID)
+		if blockedUsageError(auth.Provider, errFetch) && !ClaudeSubscriptionLapsed(auth) {
+			log.Infof("usage guard: %s subscription lapsed, stopping request routing", auth.ID)
+			m.setClaudeSubscriptionLapse(ctx, auth.ID, true)
 		}
 		log.Warnf("usage guard: %s: %v", auth.ID, errFetch)
 		// Unknown usage must not lift a hold: keep it until a check succeeds.
@@ -340,6 +349,10 @@ func (m *Manager) checkUsageGuard(ctx context.Context, guard *usageGuard, auth *
 	}
 	reset := guard.observeCodexUsage(auth, observation.signals)
 	m.applyUsageObservation(ctx, auth, observation)
+	if ClaudeSubscriptionLapsed(auth) {
+		log.Infof("usage guard: %s subscription works again, resuming request routing", auth.ID)
+		m.setClaudeSubscriptionLapse(ctx, auth.ID, false)
+	}
 	remaining := 100 - observation.weeklyUsed
 	if settings.useOnce && settings.retired {
 		return reset // Keep observing usage without restarting request routing.

@@ -565,6 +565,18 @@ func (m *Manager) availableAuthsForRouteModelWithPriorityMode(auths []*Auth, pro
 	if len(auths) == 0 {
 		return nil, &Error{Code: "auth_not_found", Message: "no auth candidates"}
 	}
+	// Routing-stopped credentials have no recovery time and their last error
+	// is not why the request failed, so they do not shape the error either.
+	routable := make([]*Auth, 0, len(auths))
+	for _, candidate := range auths {
+		if !RoutingStopped(candidate) {
+			routable = append(routable, candidate)
+		}
+	}
+	if len(routable) == 0 {
+		return nil, &Error{Code: "auth_not_found", Message: "no auth available"}
+	}
+	auths = routable
 
 	availableByPriority := make(map[int][]*Auth)
 	cooldownCount := 0

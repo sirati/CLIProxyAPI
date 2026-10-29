@@ -232,6 +232,11 @@ func (h *Handler) APICall(c *gin.Context) {
 		c.JSON(http.StatusBadGateway, gin.H{"error": "failed to read response"})
 		return
 	}
+	// The panel's Claude usage refresh doubles as a subscription check: it can
+	// confirm a lapse or resume routing to a renewed subscription.
+	if auth != nil && h.authManager != nil && method == http.MethodGet && coreauth.IsClaudeUsageURL(parsedURL) {
+		h.authManager.ObserveClaudeUsageCheck(c.Request.Context(), auth.ID, resp.StatusCode, respBody)
+	}
 
 	c.JSON(http.StatusOK, apiCallResponse{
 		StatusCode: resp.StatusCode,
