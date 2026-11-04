@@ -308,7 +308,7 @@ func (e *ClaudeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 			helps.RecordAPIResponseError(ctx, e.cfg, decErr)
 			msg := fmt.Sprintf("failed to decode error response body: %v", decErr)
 			helps.LogWithRequestID(ctx).Warn(msg)
-			errClassified := classifyClaudeUpstreamErrorWithCooling(httpResp.StatusCode, httpResp.Header, []byte(msg), e.modelLevelCooling())
+			errClassified := classifyClaudeUpstreamErrorForModel(httpResp.StatusCode, httpResp.Header, []byte(msg), gjson.GetBytes(bodyForUpstream, "model").String(), e.modelLevelCooling())
 			if fastRequest {
 				return nil, wrapClaudeFastRequestError(fastRequest, httpResp.StatusCode, errClassified)
 			}
@@ -327,9 +327,9 @@ func (e *ClaudeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 			log.Errorf("response body close error: %v", errClose)
 		}
 		if fastRequest {
-			return nil, newClaudeFastDirectResponseError(httpResp, b)
+			return nil, newClaudeFastDirectResponseErrorForModel(httpResp, b, gjson.GetBytes(bodyForUpstream, "model").String(), e.modelLevelCooling())
 		}
-		return nil, classifyClaudeUpstreamErrorWithCooling(httpResp.StatusCode, httpResp.Header, b, e.modelLevelCooling())
+		return nil, classifyClaudeUpstreamErrorForModel(httpResp.StatusCode, httpResp.Header, b, gjson.GetBytes(bodyForUpstream, "model").String(), e.modelLevelCooling())
 	}
 	decodedBody, err := decodeResponseBody(httpResp.Body, claudeResponseContentEncoding(httpResp.Header))
 	if err != nil {

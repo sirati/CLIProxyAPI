@@ -812,13 +812,30 @@ func classifyClaudeUpstreamError(statusCode int, headers http.Header, body []byt
 }
 
 func classifyClaudeUpstreamErrorWithCooling(statusCode int, headers http.Header, body []byte, modelLevelCooling bool) error {
+	return classifyClaudeUpstreamErrorForModel(statusCode, headers, body, "", modelLevelCooling)
+}
+
+func claudeRateLimitIsCredentialScoped(headers http.Header, model string, modelLevelCooling bool) bool {
+	if modelLevelCooling {
+		return false
+	}
+	model = strings.ToLower(strings.TrimSpace(model))
+	if strings.Contains(model, "fable-") || strings.Contains(model, "mythos-") {
+		// Fable has a separate allowance. Missing shared-window headers must not
+		// turn its model limit into a cooldown for Opus and the other models.
+		return helps.ClaudeHeadersExplicitlyRejectSharedQuota(headers)
+	}
+	return helps.ClaudeHeadersIndicateUnifiedRateLimitRejection(headers)
+}
+
+func classifyClaudeUpstreamErrorForModel(statusCode int, headers http.Header, body []byte, model string, modelLevelCooling bool) error {
 	var retryAfter *time.Duration
 	if statusCode == http.StatusTooManyRequests || (statusCode >= 400 && statusCode < 600) {
 		retryAfter = helps.ParseClaudeRateLimitResetForError(headers, body, time.Now())
 	}
 	err := statusErr{code: statusCode, msg: string(body), retryAfter: retryAfter}
 	if statusCode == http.StatusTooManyRequests {
-		if !modelLevelCooling && helps.ClaudeHeadersIndicateUnifiedRateLimitRejection(headers) {
+		if claudeRateLimitIsCredentialScoped(headers, model, modelLevelCooling) {
 			return claudeRateLimitError{statusErr: err, credentialScoped: true}
 		}
 		if claudeBodyIndicatesFastModeCredits(body) {

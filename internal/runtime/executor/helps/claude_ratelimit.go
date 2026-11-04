@@ -46,6 +46,18 @@ func ClaudeHeadersIndicateUnifiedRateLimitRejection(headers http.Header) bool {
 	return !isOverageOrFableOnlyRejection(headers, unifiedStatus, status5h, status7d, status7dOI)
 }
 
+// ClaudeHeadersExplicitlyRejectSharedQuota reports an explicit rejection of the
+// shared subscription allowance. Aggregate rejection alone can refer to Fable.
+func ClaudeHeadersExplicitlyRejectSharedQuota(headers http.Header) bool {
+	for _, window := range []string{"5h", "7d"} {
+		status := getHeaderCaseInsensitive(headers, "Anthropic-Ratelimit-Unified-"+window+"-Status")
+		if strings.EqualFold(strings.TrimSpace(status), "rejected") {
+			return true
+		}
+	}
+	return false
+}
+
 func isClaudeWindowAllowed(status string) bool {
 	return status == "allowed" || status == "allowed_warning"
 }
