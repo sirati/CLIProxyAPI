@@ -18,6 +18,7 @@ type providerUsageExecutor struct {
 	*usageGuardExecutor
 	bodies         map[string]string
 	statuses       map[string]int
+	headers        map[string]http.Header
 	beforeResponse func()
 }
 
@@ -38,7 +39,111 @@ func (e *providerUsageExecutor) HttpRequest(ctx context.Context, auth *Auth, req
 	if !ok {
 		return nil, fmt.Errorf("missing usage fixture for %s", auth.ID)
 	}
-	return &http.Response{StatusCode: status, Body: io.NopCloser(strings.NewReader(body))}, nil
+	return &http.Response{StatusCode: status, Header: e.headers[auth.ID], Body: io.NopCloser(strings.NewReader(body))}, nil
+}
+
+func TestUsagePollingSkipsUnusableTokens(t *testing.T) {
+	now := time.Now()
+	for _, tc := range []struct {
+		name string
+		edit func(*Auth)
+	}{
+		{"missing", func(a *Auth) { delete(a.Metadata, "access_token") }},
+		{"expired", func(a *Auth) { a.Metadata["expired"] = now.Add(-time.Hour).Format(time.RFC3339) }},
+		{"rejected", func(a *Auth) { a.RejectedAccessToken = authAccessToken(a) }},
+		{"terminal unauthorized", func(a *Auth) {
+			a.Status, a.Unavailable = StatusError, true
+			a.LastError = &Error{HTTPStatus: http.StatusUnauthorized}
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			m, a, _, e, guard := usageRecoveryFixture(t, "claude")
+			if err := m.mutateAuthAvailability(context.Background(), a.ID, func(auth *Auth, _ time.Time) bool { tc.edit(auth); return true }); err != nil {
+				t.Fatal(err)
+			}
+			m.pollUsageGuards(context.Background(), guard, now, false, "", true)
+			if e.calls[a.ID] != 0 {
+				t.Fatal("unusable access token sent to usage endpoint")
+			}
+		})
+	}
+}
+
+func TestUsageUnauthorizedPausesUntilCredentialChanges(t *testing.T) {
+	for _, provider := range []string{"claude", "codex"} {
+		t.Run(provider, func(t *testing.T) {
+			ctx := context.Background()
+			m, a, model, e, guard := usageRecoveryFixture(t, provider)
+			e.statuses[a.ID] = http.StatusUnauthorized
+			now := time.Now()
+			m.pollUsageGuards(ctx, guard, now, false, "", false)
+			m.pollUsageGuards(ctx, guard, now.Add(24*time.Hour), true, "", true)
+			if e.calls[a.ID] != 1 {
+				t.Fatalf("rejected token probed repeatedly: %d", e.calls[a.ID])
+			}
+			// A usage-only rejection does not forbid otherwise working inference.
+			if got := selectUsageGuarded(t, m, provider, model); got != a.ID {
+				t.Fatalf("usage rejection stopped inference: %s", got)
+			}
+			current, _ := m.GetByID(a.ID)
+			current.Metadata["access_token"] = "replacement-token"
+			if _, err := m.Update(ctx, current); err != nil {
+				t.Fatal(err)
+			}
+			e.statuses[a.ID] = http.StatusOK
+			m.pollUsageGuards(ctx, guard, now.Add(24*time.Hour), false, "", false)
+			if e.calls[a.ID] != 2 {
+				t.Fatal("replacement credential did not resume polling")
+			}
+		})
+	}
+}
+
+func TestUsageRateLimitBackoffSurvivesForcedSweeps(t *testing.T) {
+	ctx := context.Background()
+	m, a, _, e, guard := usageRecoveryFixture(t, "codex")
+	e.statuses[a.ID] = http.StatusTooManyRequests
+	e.headers = map[string]http.Header{a.ID: {"Retry-After": {"3600"}}}
+	now := time.Now()
+	m.pollUsageGuards(ctx, guard, now, false, "", false)
+	// Token rotation does not lift a rate limit on the same account.
+	current, _ := m.GetByID(a.ID)
+	current.Metadata["access_token"] = "rotated-token"
+	if _, err := m.Update(ctx, current); err != nil {
+		t.Fatal(err)
+	}
+	for _, minutes := range []int{5, 15, 30, 59} {
+		m.pollUsageGuards(ctx, guard, now.Add(time.Duration(minutes)*time.Minute), true, "", true)
+	}
+	if e.calls[a.ID] != 1 {
+		t.Fatal("forced sweep ignored Retry-After")
+	}
+	delete(e.headers, a.ID)
+	m.pollUsageGuards(ctx, guard, now.Add(time.Hour), false, "", false)
+	// The second consecutive 429 without Retry-After backs off for 30 minutes.
+	m.pollUsageGuards(ctx, guard, now.Add(75*time.Minute), true, "", true)
+	if e.calls[a.ID] != 2 {
+		t.Fatal("consecutive rate limits did not back off")
+	}
+	e.statuses[a.ID] = http.StatusOK
+	m.pollUsageGuards(ctx, guard, now.Add(90*time.Minute), false, "", false)
+	m.pollUsageGuards(ctx, guard, now.Add(105*time.Minute), false, "", false)
+	if e.calls[a.ID] != 4 {
+		t.Fatalf("normal polling did not resume after success: %d", e.calls[a.ID])
+	}
+}
+
+func TestUsageRetryAfter(t *testing.T) {
+	now := time.Date(2026, 11, 4, 8, 0, 0, 0, time.UTC)
+	for raw, want := range map[string]time.Duration{
+		"3600": time.Hour,
+		now.Add(2 * time.Hour).Format(http.TimeFormat): 2 * time.Hour,
+		"bad": 0, "-1": 0, "": 0,
+	} {
+		if got := usageRetryAfter(http.Header{"Retry-After": {raw}}, now); got != want {
+			t.Fatalf("Retry-After %q = %s, want %s", raw, got, want)
+		}
+	}
 }
 
 func availableUsage(provider string) string {
@@ -229,7 +334,7 @@ func TestClaudeExpiredSubscriptionStopsAutomaticPolling(t *testing.T) {
 
 func TestUsagePollingIntervalsAndCodexResetFanout(t *testing.T) {
 	m, a, model, e, guard := usageRecoveryFixture(t, "codex")
-	b := &Auth{ID: "codex-peer", Provider: "codex", Metadata: map[string]any{}}
+	b := &Auth{ID: "codex-peer", Provider: "codex", Metadata: map[string]any{"access_token": "peer-token"}}
 	if _, err := m.Register(context.Background(), b); err != nil {
 		t.Fatal(err)
 	}
@@ -326,7 +431,7 @@ func TestUsagePollingSkipsDisabledAndAPIKeyCredentials(t *testing.T) {
 		{Provider: "codex", Attributes: map[string]string{AttributeAPIKey: "test-key"}},
 		{Provider: "gemini"},
 	} {
-		if automaticUsageEligible(auth) {
+		if automaticUsageEligible(auth, time.Now()) {
 			t.Fatalf("unexpected automatic probe for %+v", auth)
 		}
 	}

@@ -112,6 +112,9 @@ type Auth struct {
 	RejectedAccessToken string `json:"-"`
 	// RejectedSIWCAccessToken tracks the nested SIWC access token rejected by upstream 401 until replaced.
 	RejectedSIWCAccessToken string `json:"-"`
+	// rejectedRefreshToken stops automatic retries after an explicit terminal rejection.
+	// A replacement token or a successful forced refresh clears it. Runtime only.
+	rejectedRefreshToken string
 
 	Success int64 `json:"-"`
 	Failed  int64 `json:"-"`

@@ -162,6 +162,12 @@ func newUsageGuardManager(t *testing.T, provider, model string, auths ...*Auth) 
 	manager.RegisterExecutor(executor)
 	reg := registry.GetGlobalRegistry()
 	for _, auth := range auths {
+		if auth.Metadata == nil {
+			auth.Metadata = make(map[string]any)
+		}
+		if authAccessToken(auth) == "" {
+			auth.Metadata["access_token"] = "usage-test-token-" + auth.ID
+		}
 		if _, errRegister := manager.Register(context.Background(), auth); errRegister != nil {
 			t.Fatalf("register %s: %v", auth.ID, errRegister)
 		}

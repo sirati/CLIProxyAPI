@@ -40,6 +40,7 @@ type usageObservation struct {
 type usageEndpointError struct {
 	status              int
 	organizationBlocked bool
+	retryAfter          time.Duration
 }
 
 func (e *usageEndpointError) Error() string {
@@ -120,9 +121,74 @@ func lapsedSubscriptionCheckDue(auth *Auth, now time.Time) bool {
 	return err != nil || !checked.Add(lapsedSubscriptionInterval).After(now)
 }
 
-func automaticUsageEligible(auth *Auth) bool {
+func automaticUsageEligible(auth *Auth, now time.Time) bool {
 	return auth != nil && usageGuardProviders[strings.ToLower(auth.Provider)] && !auth.Disabled && auth.Status != StatusDisabled &&
-		auth.AuthKind() != AuthKindAPIKey
+		auth.AuthKind() != AuthKindAPIKey && !hasUnauthorizedAuthFailure(auth) && auth.HasValidAccessToken(now)
+}
+
+// Usage failures affect polling only. A usage-endpoint 401 need not mean that
+// inference is forbidden, so it must not reject the credential for routing.
+type usageProbeFailure struct {
+	credentialVersion uint64
+	registrationEpoch uint64
+	unauthorized      bool
+	retryAt           time.Time
+	failures          int
+}
+
+func (u *usageGuard) usageProbeAllowed(auth *Auth, now time.Time) bool {
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	failure, ok := u.probeFailures[auth.ID]
+	if !ok {
+		return true
+	}
+	if failure.unauthorized && (failure.credentialVersion != auth.CredentialVersion || failure.registrationEpoch != auth.RegistrationEpoch) {
+		delete(u.probeFailures, auth.ID)
+		return true
+	}
+	return !failure.unauthorized && !failure.retryAt.After(now)
+}
+
+func (u *usageGuard) recordUsageFailure(auth *Auth, err error, now time.Time) {
+	var endpoint *usageEndpointError
+	if !errors.As(err, &endpoint) || (endpoint.status != http.StatusUnauthorized && endpoint.status != http.StatusTooManyRequests) {
+		return
+	}
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	if u.probeFailures == nil {
+		u.probeFailures = make(map[string]usageProbeFailure)
+	}
+	failure := u.probeFailures[auth.ID]
+	if failure.unauthorized && (failure.credentialVersion != auth.CredentialVersion || failure.registrationEpoch != auth.RegistrationEpoch) {
+		failure = usageProbeFailure{}
+	}
+	failure.credentialVersion = auth.CredentialVersion
+	failure.registrationEpoch = auth.RegistrationEpoch
+	failure.failures++
+	failure.unauthorized = endpoint.status == http.StatusUnauthorized
+	backoff := usageRecoveryInterval * time.Duration(1<<min(failure.failures-1, 5))
+	backoff = min(backoff, lapsedSubscriptionInterval)
+	failure.retryAt = now.Add(max(backoff, endpoint.retryAfter))
+	u.probeFailures[auth.ID] = failure
+}
+
+func (u *usageGuard) clearUsageFailure(authID string) {
+	u.mu.Lock()
+	delete(u.probeFailures, authID)
+	u.mu.Unlock()
+}
+
+func usageRetryAfter(header http.Header, now time.Time) time.Duration {
+	raw := strings.TrimSpace(header.Get("Retry-After"))
+	if seconds, err := strconv.ParseInt(raw, 10, 32); err == nil && seconds > 0 {
+		return time.Duration(seconds) * time.Second
+	}
+	if retryAt, err := http.ParseTime(raw); err == nil && retryAt.After(now) {
+		return retryAt.Sub(now)
+	}
+	return 0
 }
 
 func blockedUsageError(provider string, err error) bool {
@@ -214,7 +280,7 @@ func (m *Manager) fetchUsageObservation(ctx context.Context, auth *Auth) (usageO
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		blocked := !isCodex && resp.StatusCode == http.StatusForbidden && claudeUsageOrganizationBlocked(body)
-		return usageObservation{}, &usageEndpointError{status: resp.StatusCode, organizationBlocked: blocked}
+		return usageObservation{}, &usageEndpointError{status: resp.StatusCode, organizationBlocked: blocked, retryAfter: usageRetryAfter(resp.Header, time.Now())}
 	}
 	return parseUsageObservation(auth.Provider, body)
 }

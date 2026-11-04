@@ -212,10 +212,11 @@ type usageGuard struct {
 	mu sync.Mutex
 	// holds maps auth ID to the recovery time of the hold this guard set, so a
 	// release never clears a cooldown that came from an upstream 429.
-	holds      map[string]time.Time
-	lastChecks map[string]time.Time
-	codexUsage map[string]map[string]string
-	wake       chan string
+	holds         map[string]time.Time
+	lastChecks    map[string]time.Time
+	codexUsage    map[string]map[string]string
+	wake          chan string
+	probeFailures map[string]usageProbeFailure
 }
 
 // StartUsageGuard checks guarded credentials every five minutes and other OAuth
@@ -275,6 +276,12 @@ func (m *Manager) pollUsageGuards(ctx context.Context, guard *usageGuard, now ti
 	checked := make(map[string]bool)
 	reset := false
 	check := func(auth *Auth) {
+		if !guard.usageProbeAllowed(auth, now) {
+			if _, held := guard.held(auth.ID); held {
+				m.applyUsageHold(ctx, guard, auth.ID, "usage polling paused, keeping the hold")
+			}
+			return
+		}
 		checked[auth.ID] = true
 		guard.recordUsageCheck(auth.ID, now)
 		settings, enabled := usageGuardSettingsOf(auth)
@@ -286,7 +293,7 @@ func (m *Manager) pollUsageGuards(ctx context.Context, guard *usageGuard, now ti
 				}
 			}
 		}
-		if m.checkUsageGuard(ctx, guard, auth, settings) {
+		if m.checkUsageGuard(ctx, guard, auth, settings, now) {
 			reset = true
 		}
 	}
@@ -294,7 +301,7 @@ func (m *Manager) pollUsageGuards(ctx context.Context, guard *usageGuard, now ti
 		if ctx.Err() != nil {
 			return
 		}
-		if !automaticUsageEligible(auth) {
+		if !automaticUsageEligible(auth, now) {
 			continue
 		}
 		if auth.ID == source {
@@ -326,16 +333,17 @@ func (m *Manager) pollUsageGuards(ctx context.Context, guard *usageGuard, now ti
 			if ctx.Err() != nil {
 				return
 			}
-			if auth.Provider == "codex" && !checked[auth.ID] && auth.ID != source && automaticUsageEligible(auth) {
+			if auth.Provider == "codex" && !checked[auth.ID] && auth.ID != source && automaticUsageEligible(auth, now) {
 				check(auth)
 			}
 		}
 	}
 }
 
-func (m *Manager) checkUsageGuard(ctx context.Context, guard *usageGuard, auth *Auth, settings usageGuardSettings) bool {
+func (m *Manager) checkUsageGuard(ctx context.Context, guard *usageGuard, auth *Auth, settings usageGuardSettings, now time.Time) bool {
 	observation, errFetch := m.fetchUsageObservation(ctx, auth)
 	if errFetch != nil {
+		guard.recordUsageFailure(auth, errFetch, now)
 		if blockedUsageError(auth.Provider, errFetch) && !ClaudeSubscriptionLapsed(auth) {
 			log.Infof("usage guard: %s subscription lapsed, stopping request routing", auth.ID)
 			m.setClaudeSubscriptionLapse(ctx, auth.ID, true)
@@ -347,6 +355,7 @@ func (m *Manager) checkUsageGuard(ctx context.Context, guard *usageGuard, auth *
 		}
 		return false
 	}
+	guard.clearUsageFailure(auth.ID)
 	reset := guard.observeCodexUsage(auth, observation.signals)
 	m.applyUsageObservation(ctx, auth, observation)
 	if ClaudeSubscriptionLapsed(auth) {

@@ -118,7 +118,7 @@ func (m *Manager) shouldRefresh(a *Auth, now time.Time) bool {
 	if a == nil {
 		return false
 	}
-	if hasUnauthorizedAuthFailure(a) || hasDisabledInvalidGrantFailure(a) {
+	if hasUnauthorizedAuthFailure(a) || hasDisabledInvalidGrantFailure(a) || hasRejectedRefreshToken(a) {
 		return false
 	}
 	if !a.NextRefreshAfter.IsZero() && now.Before(a.NextRefreshAfter) {
@@ -338,7 +338,7 @@ func lookupMetadataTime(meta map[string]any, keys ...string) (time.Time, bool) {
 func (m *Manager) markRefreshPending(loop *authAutoRefreshLoop, id string, registrationEpoch uint64, now time.Time) *authRefreshJob {
 	m.mu.Lock()
 	auth := m.auths[id]
-	if auth == nil || auth.RegistrationEpoch != registrationEpoch || hasUnauthorizedAuthFailure(auth) || hasDisabledInvalidGrantFailure(auth) {
+	if auth == nil || auth.RegistrationEpoch != registrationEpoch || hasUnauthorizedAuthFailure(auth) || hasDisabledInvalidGrantFailure(auth) || hasRejectedRefreshToken(auth) {
 		m.mu.Unlock()
 		return nil
 	}
@@ -417,6 +417,15 @@ func authRefreshToken(auth *Auth) string {
 		return token
 	}
 	return authMetadataString(auth, "refreshToken")
+}
+
+func hasRejectedRefreshToken(auth *Auth) bool {
+	return auth != nil && auth.rejectedRefreshToken != "" && auth.rejectedRefreshToken == authRefreshToken(auth)
+}
+
+func isExpiredClaudeRefreshToken(provider string, err error) bool {
+	return strings.EqualFold(provider, "claude") && isInvalidGrantError(err) &&
+		strings.Contains(strings.ToLower(err.Error()), "refresh token expired")
 }
 
 func authHasRefreshCredential(auth *Auth) bool {
@@ -531,6 +540,10 @@ func shouldPreserveRejectedSIWCAccessToken(existing, updated *Auth) (string, boo
 func applyPreservedRejectedTokens(existing, updated *Auth, isRefresh bool) {
 	if updated == nil {
 		return
+	}
+	updated.rejectedRefreshToken = ""
+	if existing != nil && !isRefresh && existing.rejectedRefreshToken == authRefreshToken(updated) {
+		updated.rejectedRefreshToken = existing.rejectedRefreshToken
 	}
 	if rejectedSIWC, ok := shouldPreserveRejectedSIWCAccessToken(existing, updated); ok {
 		updated.RejectedSIWCAccessToken = rejectedSIWC
@@ -958,6 +971,9 @@ func (m *Manager) refreshAuthForRequestAtEpoch(ctx context.Context, id, failedAc
 	if hasUnauthorizedAuthFailure(auth) && !forceRefresh {
 		return nil, errors.New("auth is unauthorized")
 	}
+	if hasRejectedRefreshToken(auth) && !forceRefresh {
+		return nil, errors.New("Claude refresh token expired; sign in again")
+	}
 
 	// Another request may already have refreshed this credential.
 	if failedAccessToken != "" {
@@ -989,12 +1005,17 @@ func (m *Manager) refreshAuthForRequestAtEpoch(ctx context.Context, id, failedAc
 	if err != nil {
 		unauthorized := isUnauthorizedError(err)
 		invalidGrant := isInvalidGrantError(err)
+		expiredClaudeRefresh := isExpiredClaudeRefreshToken(auth.Provider, err)
 		shouldReschedule := false
 		isDisabled := false
 		shouldUnschedule := false
 		m.mu.Lock()
 		if current := m.auths[id]; current != nil {
 			if base != nil && current.RegistrationEpoch != base.RegistrationEpoch {
+				m.mu.Unlock()
+				return nil, err
+			}
+			if expiredClaudeRefresh && authRefreshToken(current) != authRefreshToken(base) {
 				m.mu.Unlock()
 				return nil, err
 			}
@@ -1046,6 +1067,21 @@ func (m *Manager) refreshAuthForRequestAtEpoch(ctx context.Context, id, failedAc
 					current.StatusMessage = "disabled"
 				}
 				shouldReschedule = true
+			} else if expiredClaudeRefresh {
+				// An explicitly expired refresh token cannot recover through retries.
+				// Keep an unexpired access token usable until it expires or is rejected.
+				current.rejectedRefreshToken = authRefreshToken(current)
+				current.NextRefreshAfter = time.Time{}
+				current.RefreshFailures = 0
+				shouldUnschedule = true
+				if !hasValidAccessToken || accessTokenRejected {
+					current.Unavailable = true
+					current.Status = StatusError
+					current.LastError = &Error{Code: "unauthorized", Message: err.Error(), HTTPStatus: http.StatusUnauthorized}
+					current.NextRetryAfter = time.Time{}
+					current.StatusMessage = "refresh token expired (login required)"
+				}
+				log.Warnf("Claude refresh token expired for %s; stopping automatic refresh until credentials change", current.ID)
 			} else if accessTokenRejected && invalidGrant {
 				// Neither token can recover without a new login. Stop selecting the
 				// credential until its tokens change instead of retrying it after
