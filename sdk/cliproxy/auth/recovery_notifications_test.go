@@ -8,9 +8,9 @@ import (
 	"testing"
 	"time"
 
+	"github.com/MoeForge/moego/ojson"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/registry"
-	"github.com/tidwall/gjson"
 )
 
 func TestRecoveryTracksModelAndCredentialAvailability(t *testing.T) {
@@ -23,7 +23,7 @@ func TestRecoveryTracksModelAndCredentialAvailability(t *testing.T) {
 	if marker == "" || !errors.Is(tracked, original) {
 		t.Fatalf("lost marker, error identity or JSON: %v", tracked)
 	}
-	if !gjson.Valid(appendRecoveryMarker(original.Message, "test")) {
+	if !ojson.Valid(appendRecoveryMarker(original.Message, "test")) {
 		t.Fatal("structured error was corrupted")
 	}
 	id := strings.TrimSuffix(strings.TrimPrefix(marker, " [cliproxy-recovery:"), "]")

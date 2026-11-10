@@ -9,13 +9,13 @@ import (
 	"testing"
 	"time"
 
+	"github.com/MoeForge/moego/ojson"
 	"github.com/gin-gonic/gin"
 	"github.com/gorilla/websocket"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/interfaces"
 	"github.com/router-for-me/CLIProxyAPI/v8/sdk/api/handlers"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
 	sdkconfig "github.com/router-for-me/CLIProxyAPI/v8/sdk/config"
-	"github.com/tidwall/gjson"
 )
 
 func codexCooldownMessage() *interfaces.ErrorMessage {
@@ -34,13 +34,13 @@ func TestResponsesWriteErrorResponseAnswersAUsageLimit(t *testing.T) {
 	h.WriteErrorResponse(c, codexCooldownMessage())
 
 	body := recorder.Body.Bytes()
-	if recorder.Code != http.StatusTooManyRequests || gjson.GetBytes(body, "error.type").String() != "usage_limit_reached" {
+	if recorder.Code != http.StatusTooManyRequests || ojson.GetBytes(body, "error.type").String() != "usage_limit_reached" {
 		t.Fatalf("status = %d, body = %s", recorder.Code, body)
 	}
-	if got := gjson.GetBytes(body, "error.resets_in_seconds").Int(); got != 5400 {
+	if got := ojson.GetBytes(body, "error.resets_in_seconds").Int(); got != 5400 {
 		t.Fatalf("resets_in_seconds = %d, want 5400", got)
 	}
-	resetsAt := gjson.GetBytes(body, "error.resets_at").String()
+	resetsAt := ojson.GetBytes(body, "error.resets_at").String()
 	if recorder.Header().Get("X-Codex-Primary-Used-Percent") != "100" || recorder.Header().Get("X-Codex-Primary-Reset-At") != resetsAt {
 		t.Fatalf("headers = %v, want a full primary window resetting at %s", recorder.Header(), resetsAt)
 	}
@@ -99,18 +99,18 @@ func TestResponsesWebsocketAnswersAUsageLimit(t *testing.T) {
 
 	// Codex reads this event as a 429 response: the error is its body, the
 	// headers its rate-limit snapshot.
-	if gjson.GetBytes(payload, "type").String() != "error" || gjson.GetBytes(payload, "status").Int() != http.StatusTooManyRequests {
+	if ojson.GetBytes(payload, "type").String() != "error" || ojson.GetBytes(payload, "status").Int() != http.StatusTooManyRequests {
 		t.Fatalf("payload = %s", payload)
 	}
-	if gjson.GetBytes(payload, "error.type").String() != "usage_limit_reached" {
+	if ojson.GetBytes(payload, "error.type").String() != "usage_limit_reached" {
 		t.Fatalf("payload = %s", payload)
 	}
-	if !strings.Contains(gjson.GetBytes(payload, "error.message").String(), marker) {
+	if !strings.Contains(ojson.GetBytes(payload, "error.message").String(), marker) {
 		t.Fatalf("websocket lost marker: %s", payload)
 	}
-	resetsAt := strconv.FormatInt(gjson.GetBytes(payload, "error.resets_at").Int(), 10)
-	if gjson.GetBytes(payload, "headers.X-Codex-Primary-Used-Percent").String() != "100" ||
-		gjson.GetBytes(payload, "headers.X-Codex-Primary-Reset-At").String() != resetsAt {
+	resetsAt := strconv.FormatInt(ojson.GetBytes(payload, "error.resets_at").Int(), 10)
+	if ojson.GetBytes(payload, "headers.X-Codex-Primary-Used-Percent").String() != "100" ||
+		ojson.GetBytes(payload, "headers.X-Codex-Primary-Reset-At").String() != resetsAt {
 		t.Fatalf("payload = %s, want a full primary window resetting at %s", payload, resetsAt)
 	}
 }
@@ -128,7 +128,7 @@ func TestResponsesWriteErrorResponseAnswersAPacedRequestWithItsTurn(t *testing.T
 	if recorder.Code != http.StatusTooManyRequests || recorder.Header().Get("Retry-After") != "84" {
 		t.Fatalf("status = %d, Retry-After = %q, body = %s", recorder.Code, recorder.Header().Get("Retry-After"), body)
 	}
-	if gjson.GetBytes(body, "error.type").String() == "usage_limit_reached" || recorder.Header().Get("X-Codex-Primary-Used-Percent") != "" {
+	if ojson.GetBytes(body, "error.type").String() == "usage_limit_reached" || recorder.Header().Get("X-Codex-Primary-Used-Percent") != "" {
 		t.Fatalf("a paced request was answered as a usage limit: %s", body)
 	}
 }
@@ -142,7 +142,7 @@ func TestResponsesWriteErrorResponseTellsAnExhaustedRetryTheReset(t *testing.T) 
 	h.WriteErrorResponse(c, &interfaces.ErrorMessage{StatusCode: http.StatusTooManyRequests, Error: coreauth.NewCodexPacedError(3*time.Minute, true)})
 
 	body := recorder.Body.Bytes()
-	if gjson.GetBytes(body, "error.type").String() != "usage_limit_reached" || gjson.GetBytes(body, "error.resets_in_seconds").Int() != 180 {
+	if ojson.GetBytes(body, "error.type").String() != "usage_limit_reached" || ojson.GetBytes(body, "error.resets_in_seconds").Int() != 180 {
 		t.Fatalf("status = %d, body = %s; want a usage limit resetting in 180s", recorder.Code, body)
 	}
 }
@@ -163,7 +163,7 @@ func TestResponsesLimitPreservesRecoveryMarker(t *testing.T) {
 	recorder := httptest.NewRecorder()
 	c, _ := gin.CreateTestContext(recorder)
 	h.WriteErrorResponse(c, msg)
-	if !strings.Contains(gjson.GetBytes(recorder.Body.Bytes(), "error.message").String(), marker) {
+	if !strings.Contains(ojson.GetBytes(recorder.Body.Bytes(), "error.message").String(), marker) {
 		t.Fatalf("marker lost from HTTP: %s", recorder.Body.String())
 	}
 }

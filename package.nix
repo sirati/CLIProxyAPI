@@ -31,11 +31,11 @@ in
   __structuredAttrs = true;
 
   pname = "cliproxyapi";
-  version = "8.0.29-sirati+${rev}";
+  version = "8.0.64-sirati+${rev}";
 
   inherit src;
 
-  vendorHash = "sha256-yMO0DdE0pjtFxWaQXV17enV8u0KA5fIUbE8Gui/RvWU=";
+  vendorHash = "sha256-02Qqrs9lQ0kE+Tnk/SWvlkLXGSh8RQPxRawFZogRYNc=";
 
   subPackages = [ "cmd/server" ];
 

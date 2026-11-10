@@ -44,6 +44,7 @@ type responsesWebsocketHandoffVars struct {
 	PassthroughModelName           *string
 	UpstreamMode                   *string
 	UpstreamWebsocketAuthID        *string
+	LocalCompactionBoundary        *bool
 }
 
 type responsesWebsocketHandoffCompaction struct {
@@ -73,6 +74,7 @@ type responsesWebsocketHandoffState struct {
 	PassthroughModelName           string                                  `json:"passthrough_model_name,omitempty"`
 	UpstreamMode                   string                                  `json:"upstream_mode,omitempty"`
 	UpstreamWebsocketAuthID        string                                  `json:"upstream_websocket_auth_id,omitempty"`
+	LocalCompactionBoundary        bool                                    `json:"local_compaction_boundary,omitempty"`
 }
 
 type responsesWebsocketHandoffToolEntry struct {
@@ -172,6 +174,9 @@ func (v *responsesWebsocketHandoffVars) snapshot() responsesWebsocketHandoffStat
 		UpstreamWebsocketAuthID:        *v.UpstreamWebsocketAuthID,
 	}
 	compaction := v.ObservedCompaction
+	if v.LocalCompactionBoundary != nil {
+		state.LocalCompactionBoundary = *v.LocalCompactionBoundary
+	}
 	state.ObservedCompaction = responsesWebsocketHandoffCompaction{
 		ModelName: compaction.modelName, ModelKey: compaction.modelKey, AuthID: compaction.authID,
 		PluginID: compaction.pluginID, Provider: compaction.provider, TargetModel: compaction.targetModel,
@@ -186,6 +191,9 @@ func (v *responsesWebsocketHandoffVars) snapshot() responsesWebsocketHandoffStat
 }
 
 func (v *responsesWebsocketHandoffVars) restore(state responsesWebsocketHandoffState) {
+	if v.LocalCompactionBoundary != nil {
+		*v.LocalCompactionBoundary = state.LocalCompactionBoundary
+	}
 	*v.LastRequest = state.LastRequest
 	if state.LastResponseOutput != nil {
 		*v.LastResponseOutput = state.LastResponseOutput

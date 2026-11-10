@@ -12,10 +12,10 @@ import (
 	"sync"
 	"time"
 
+	"github.com/MoeForge/moego/ojson"
 	internallogging "github.com/router-for-me/CLIProxyAPI/v8/internal/logging"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/executor"
 	log "github.com/sirupsen/logrus"
-	"github.com/tidwall/gjson"
 )
 
 // A Codex account answers bursts with 429 {"detail":"Rate limit exceeded"},
@@ -383,7 +383,7 @@ func latest(times ...time.Time) time.Time {
 // one request in flight per turn and sends the turn in every attempt.
 func codexPaceKey(headers http.Header) string {
 	meta := headers.Get("X-Codex-Turn-Metadata")
-	thread, turn := gjson.Get(meta, "thread_id").String(), gjson.Get(meta, "turn_id").String()
+	thread, turn := ojson.Get(meta, "thread_id").String(), ojson.Get(meta, "turn_id").String()
 	if thread == "" || turn == "" {
 		return ""
 	}

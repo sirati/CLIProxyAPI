@@ -11,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/MoeForge/moego/ojson"
 	"github.com/gin-gonic/gin"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/interfaces"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/registry"
@@ -18,7 +19,6 @@ import (
 	coreauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
 	coreexecutor "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/executor"
 	sdkconfig "github.com/router-for-me/CLIProxyAPI/v8/sdk/config"
-	"github.com/tidwall/gjson"
 )
 
 func TestClaudeErrorTypeFromStatus(t *testing.T) {
@@ -87,13 +87,13 @@ func TestClaudeIncompleteStreamError(t *testing.T) {
 				_, body, _ = strings.Cut(body, prefix)
 				body = strings.TrimSpace(body)
 			}
-			if got := gjson.Get(body, "type").String(); got != "error" {
+			if got := ojson.Get(body, "type").String(); got != "error" {
 				t.Errorf("type = %q, want error", got)
 			}
-			if got := gjson.Get(body, "error.type").String(); got != "timeout_error" {
+			if got := ojson.Get(body, "error.type").String(); got != "timeout_error" {
 				t.Errorf("error.type = %q, want timeout_error", got)
 			}
-			if got := gjson.Get(body, "error.message").String(); got != message {
+			if got := ojson.Get(body, "error.message").String(); got != message {
 				t.Errorf("error.message = %q, want %q", got, message)
 			}
 		})
@@ -155,7 +155,7 @@ func TestClaudeErrorMarksWrappedMissingThreadForClientReplay(t *testing.T) {
 	if errMarshal != nil {
 		t.Fatalf("marshal Claude error: %v", errMarshal)
 	}
-	if got := gjson.GetBytes(body, "error.details.error_code").String(); got != "thread_not_found" {
+	if got := ojson.GetBytesNoCopy(body, "error.details.error_code").String(); got != "thread_not_found" {
 		t.Fatalf("error.details.error_code = %q, want thread_not_found; body=%s", got, body)
 	}
 }
@@ -171,7 +171,7 @@ func TestClaudeErrorMarksMissingThreadForClientReplay(t *testing.T) {
 	if errMarshal != nil {
 		t.Fatalf("marshal Claude error: %v", errMarshal)
 	}
-	if got := gjson.GetBytes(body, "error.details.error_code").String(); got != "thread_not_found" {
+	if got := ojson.GetBytesNoCopy(body, "error.details.error_code").String(); got != "thread_not_found" {
 		t.Fatalf("error.details.error_code = %q, want thread_not_found; body=%s", got, body)
 	}
 }
@@ -187,7 +187,7 @@ func TestClaudeErrorMarksPlainTextMissingThreadForClientReplay(t *testing.T) {
 	if errMarshal != nil {
 		t.Fatalf("marshal Claude error: %v", errMarshal)
 	}
-	if got := gjson.GetBytes(body, "error.details.error_code").String(); got != "thread_not_found" {
+	if got := ojson.GetBytesNoCopy(body, "error.details.error_code").String(); got != "thread_not_found" {
 		t.Fatalf("error.details.error_code = %q, want thread_not_found; body=%s", got, body)
 	}
 }
@@ -214,7 +214,7 @@ func TestClaudeErrorMarksStructuredExecutorMissingThreadForClientReplay(t *testi
 	if errMarshal != nil {
 		t.Fatalf("marshal Claude error: %v", errMarshal)
 	}
-	if got := gjson.GetBytes(body, "error.details.error_code").String(); got != "thread_not_found" {
+	if got := ojson.GetBytesNoCopy(body, "error.details.error_code").String(); got != "thread_not_found" {
 		t.Fatalf("error.details.error_code = %q, want thread_not_found; body=%s", got, body)
 	}
 }
@@ -232,7 +232,7 @@ func TestWriteClaudeDirectErrorMarksMissingThreadForClientReplay(t *testing.T) {
 
 	handler.WriteErrorResponse(c, msg)
 
-	if got := gjson.GetBytes(recorder.Body.Bytes(), "error.details.error_code").String(); got != "thread_not_found" {
+	if got := ojson.GetBytesNoCopy(recorder.Body.Bytes(), "error.details.error_code").String(); got != "thread_not_found" {
 		t.Fatalf("error.details.error_code = %q, want thread_not_found; body=%s", got, recorder.Body.Bytes())
 	}
 }
@@ -253,13 +253,13 @@ func TestWriteClaudeErrorResponseUsesClaudeEnvelope(t *testing.T) {
 		t.Fatalf("status = %d, want %d", recorder.Code, http.StatusBadRequest)
 	}
 	body := recorder.Body.Bytes()
-	if got := gjson.GetBytes(body, "type").String(); got != "error" {
+	if got := ojson.GetBytesNoCopy(body, "type").String(); got != "error" {
 		t.Fatalf("type = %q, want error; body=%s", got, body)
 	}
-	if got := gjson.GetBytes(body, "error.type").String(); got != "invalid_request_error" {
+	if got := ojson.GetBytesNoCopy(body, "error.type").String(); got != "invalid_request_error" {
 		t.Fatalf("error.type = %q, want invalid_request_error; body=%s", got, body)
 	}
-	if got := gjson.GetBytes(body, "error.message").String(); got != "Your input exceeds the context window of this model. Please adjust your input and try again." {
+	if got := ojson.GetBytesNoCopy(body, "error.message").String(); got != "Your input exceeds the context window of this model. Please adjust your input and try again." {
 		t.Fatalf("error.message = %q; body=%s", got, body)
 	}
 }
@@ -272,7 +272,7 @@ func TestWriteClaudeErrorResponse_ModelCooldownCarriesReset(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	recorder := httptest.NewRecorder()
 	c, _ := gin.CreateTestContext(recorder)
-	handler := &ClaudeCodeAPIHandler{}
+	handler := NewClaudeCodeAPIHandler(handlers.NewBaseAPIHandlers(nil, coreauth.NewManager(nil, nil, nil)))
 
 	msg := &interfaces.ErrorMessage{
 		StatusCode: http.StatusTooManyRequests,
@@ -291,7 +291,7 @@ func TestWriteClaudeErrorResponse_ModelCooldownCarriesReset(t *testing.T) {
 		t.Fatalf("Retry-After = %q, want 9005", got)
 	}
 	// Claude Code prints "API Error: <status> <error.message>" for such a body.
-	result := "API Error: 503 " + gjson.GetBytes(recorder.Body.Bytes(), "error.message").String()
+	result := "API Error: 503 " + ojson.GetBytes(recorder.Body.Bytes(), "error.message").String()
 	match := t3CodeGatewayLimit.FindStringSubmatch(result)
 	if match == nil || match[1] != "2" || match[2] != "30" || match[3] != "5" {
 		t.Fatalf("result %q does not carry the reset as T3 Code reads it: %v", result, match)

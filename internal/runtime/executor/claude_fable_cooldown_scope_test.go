@@ -8,15 +8,21 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/MoeForge/moego/ojson"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/registry"
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/executor"
 	sdktranslator "github.com/router-for-me/CLIProxyAPI/v8/sdk/translator"
-	"github.com/tidwall/gjson"
 )
 
 func TestFableRateLimitDoesNotCoolOpusWithoutSharedRejection(t *testing.T) {
+	for _, model := range []string{"claude-fable-5-1", "claude-fable-5-2"} {
+		t.Run(model, func(t *testing.T) { testFableRateLimitScope(t, model) })
+	}
+}
+
+func testFableRateLimitScope(t *testing.T, model string) {
 	for _, path := range []string{"execute", "stream", "count_tokens", "fast_execute", "fast_stream"} {
 		for _, sharedWindow := range []string{"", "5h", "7d"} {
 			t.Run(path+"/shared_"+sharedWindow, func(t *testing.T) {
@@ -30,7 +36,7 @@ func TestFableRateLimitDoesNotCoolOpusWithoutSharedRejection(t *testing.T) {
 					headers := http.Header{"Content-Type": {"application/json"}}
 					status := http.StatusOK
 					response := `{"id":"opus-ok","type":"message","role":"assistant","model":"claude-opus-5-5","content":[{"type":"text","text":"ok"}]}`
-					if strings.Contains(string(body), `"model":"claude-fable-5-1"`) {
+					if ojson.GetBytes(body, "model").String() == model {
 						fableAttempts++
 						headers.Set("Anthropic-Ratelimit-Unified-Status", "rejected")
 						headers.Set("Anthropic-Ratelimit-Unified-7d_oi-Status", "rejected")
@@ -54,13 +60,14 @@ func TestFableRateLimitDoesNotCoolOpusWithoutSharedRejection(t *testing.T) {
 					t.Fatal(err)
 				}
 				reg := registry.GetGlobalRegistry()
-				reg.RegisterClient(auth.ID, "claude", []*registry.ModelInfo{{ID: "claude-fable-5-1"}, {ID: "claude-opus-5-5"}})
+				reg.RegisterClient(auth.ID, "claude", []*registry.ModelInfo{{ID: model}, {ID: "claude-opus-5-5"}})
 				t.Cleanup(func() { reg.UnregisterClient(auth.ID) })
 				payload := `{"model":"claude-fable-5-1","max_tokens":16,"messages":[{"role":"user","content":"test"}]}`
 				if strings.HasPrefix(path, "fast_") {
 					payload = `{"model":"claude-fable-5-1","max_tokens":16,"speed":"fast","messages":[{"role":"user","content":"test"}]}`
 				}
-				req := cliproxyexecutor.Request{Model: "claude-fable-5-1", Payload: []byte(payload)}
+				payload = strings.ReplaceAll(payload, "claude-fable-5-1", model)
+				req := cliproxyexecutor.Request{Model: model, Payload: []byte(payload)}
 				opts := cliproxyexecutor.Options{SourceFormat: sdktranslator.FormatClaude, ResponseFormat: sdktranslator.FormatClaude}
 				var err error
 				switch path {
@@ -106,7 +113,7 @@ func TestFableRateLimitScopeUsesFinalPayloadModel(t *testing.T) {
 					if err != nil {
 						return nil, err
 					}
-					if got := gjson.GetBytes(body, "model").String(); got != target {
+					if got := ojson.GetBytes(body, "model").String(); got != target {
 						t.Fatalf("wire model = %s, want %s", got, target)
 					}
 					return &http.Response{StatusCode: http.StatusTooManyRequests, Request: req,

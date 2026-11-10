@@ -24,6 +24,7 @@ var responsesWebsocketHandoffCarried = map[string]bool{
 	"passthroughModelName":           true,
 	"upstreamMode":                   true,
 	"upstreamWebsocketAuthID":        true,
+	"localCompactionBoundary":        true,
 }
 
 var responsesWebsocketHandoffNotState = map[string]bool{}

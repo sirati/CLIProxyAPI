@@ -9,9 +9,9 @@ import (
 	"sync"
 	"time"
 
+	"github.com/MoeForge/moego/ojson"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/registry"
 	log "github.com/sirupsen/logrus"
-	"github.com/tidwall/gjson"
 )
 
 // Credential metadata keys read by the usage guard. Both are set per auth file,
@@ -148,11 +148,11 @@ func decideUsageGuard(settings usageGuardSettings, remaining float64) usageGuard
 // parseClaudeWeeklyUsage reads seven_day.utilization (percent) from a Claude
 // GET /api/oauth/usage body.
 func parseClaudeWeeklyUsage(body []byte) (float64, error) {
-	if !gjson.ValidBytes(body) {
+	if !ojson.ValidBytes(body) {
 		return 0, fmt.Errorf("usage body is not JSON")
 	}
-	used := gjson.GetBytes(body, "seven_day.utilization")
-	if used.Type != gjson.Number {
+	used := ojson.GetBytes(body, "seven_day.utilization")
+	if used.Type != ojson.Number {
 		return 0, fmt.Errorf("usage body has no seven_day.utilization")
 	}
 	return min(max(used.Float(), 0), 100), nil
@@ -164,14 +164,14 @@ func parseClaudeWeeklyUsage(body []byte) (float64, error) {
 // counts as the long window here. Without durations the secondary window is
 // the long one.
 func parseCodexWeeklyUsage(body []byte) (float64, error) {
-	if !gjson.ValidBytes(body) {
+	if !ojson.ValidBytes(body) {
 		return 0, fmt.Errorf("usage body is not JSON")
 	}
-	rateLimit := firstGJSON(gjson.ParseBytes(body), "rate_limit", "rateLimit")
+	rateLimit := firstGJSON(ojson.ParseBytes(body), "rate_limit", "rateLimit")
 	if !rateLimit.IsObject() {
 		return 0, fmt.Errorf("usage body has no rate_limit")
 	}
-	var weekly gjson.Result
+	var weekly ojson.Result
 	for _, keys := range [][]string{{"primary_window", "primaryWindow"}, {"secondary_window", "secondaryWindow"}} {
 		window := firstGJSON(rateLimit, keys...)
 		seconds := firstGJSON(window, "limit_window_seconds", "limitWindowSeconds").Int()
@@ -184,26 +184,26 @@ func parseCodexWeeklyUsage(body []byte) (float64, error) {
 		weekly = firstGJSON(rateLimit, "secondary_window", "secondaryWindow")
 		if firstGJSON(weekly, "limit_window_seconds", "limitWindowSeconds").Exists() {
 			// Durations are given and none is a week or a month.
-			weekly = gjson.Result{}
+			weekly = ojson.Result{}
 		}
 	}
 	if !weekly.IsObject() {
 		return 0, fmt.Errorf("usage body has no weekly window")
 	}
 	used := firstGJSON(weekly, "used_percent", "usedPercent")
-	if used.Type != gjson.Number {
+	if used.Type != ojson.Number {
 		return 0, fmt.Errorf("usage body has no weekly used_percent")
 	}
 	return min(max(used.Float(), 0), 100), nil
 }
 
-func firstGJSON(object gjson.Result, paths ...string) gjson.Result {
+func firstGJSON(object ojson.Result, paths ...string) ojson.Result {
 	for _, path := range paths {
 		if value := object.Get(path); value.Exists() {
 			return value
 		}
 	}
-	return gjson.Result{}
+	return ojson.Result{}
 }
 
 type usageGuard struct {

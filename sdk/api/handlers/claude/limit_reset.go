@@ -31,6 +31,10 @@ type claudeLimitErrorDetail struct {
 // travel in the message: a 503 the client does not retry, carrying a wrapped
 // 429 and "(reset after 5h 59m 30s)", which T3 Code turns into a timed resume.
 func (h *ClaudeCodeAPIHandler) writeLimitResponse(c *gin.Context, msg *interfaces.ErrorMessage) bool {
+	// The pool-wide resume response requires a manager that owns that pool.
+	if h == nil || h.BaseAPIHandler == nil || h.AuthManager == nil {
+		return false
+	}
 	reset, answer := h.LimitReset(msg, "claude")
 	if answer != handlers.LimitReached {
 		return false

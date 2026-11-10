@@ -38,7 +38,10 @@ func (s *FileSynthesizer) Synthesize(ctx *SynthesisContext) ([]*coreauth.Auth, e
 
 	entries, err := os.ReadDir(ctx.AuthDir)
 	if err != nil {
-		// Not an error if directory doesn't exist
+		// A missing directory holds no auths; any other read failure keeps the loaded ones.
+		if !errors.Is(err, fs.ErrNotExist) {
+			ctx.RecordIncompleteFile(ctx.AuthDir)
+		}
 		return out, nil
 	}
 
@@ -123,6 +126,15 @@ func synthesizeFileAuths(ctx *SynthesisContext, fullPath string, data []byte) ([
 			if len(auths) == 0 {
 				return nil, nil
 			}
+			filePortalHint := ""
+			for _, key := range []string{"oauth_provider", "portal"} {
+				if raw, ok := metadata[key].(string); ok {
+					if hint := strings.ToLower(strings.TrimSpace(raw)); hint != "" {
+						filePortalHint = hint
+						break
+					}
+				}
+			}
 			perAccountModelAliases := extractOAuthModelAliasesFromMetadata(metadata)
 			disabled, _ := metadata["disabled"].(bool)
 			for index, auth := range auths {
@@ -130,6 +142,29 @@ func synthesizeFileAuths(ctx *SynthesisContext, fullPath string, data []byte) ([
 					continue
 				}
 				coreauth.NormalizeCredentialMetadata(auth.Metadata)
+				if filePortalHint != "" {
+					hasPortalHint := false
+					for _, key := range []string{"oauth_provider", "portal"} {
+						raw, _ := auth.Metadata[key].(string)
+						if strings.TrimSpace(auth.Attributes[key]) != "" || strings.TrimSpace(raw) != "" {
+							hasPortalHint = true
+							break
+						}
+					}
+					if !hasPortalHint {
+						if auth.Metadata == nil {
+							auth.Metadata = make(map[string]any)
+						}
+						if auth.Attributes == nil {
+							auth.Attributes = make(map[string]string)
+						}
+						auth.Metadata["oauth_provider"] = filePortalHint
+						auth.Attributes["oauth_provider"] = filePortalHint
+						if setter, ok := auth.Storage.(interface{ SetMetadata(map[string]any) }); ok {
+							setter.SetMetadata(auth.Metadata)
+						}
+					}
+				}
 				if len(auths) > 1 {
 					coreauth.MarkPluginVirtualAuth(auth, fullPath, index)
 				}

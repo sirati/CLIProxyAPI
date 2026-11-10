@@ -11,8 +11,8 @@ import (
 	"strings"
 	"time"
 
+	"github.com/MoeForge/moego/ojson"
 	log "github.com/sirupsen/logrus"
-	"github.com/tidwall/gjson"
 )
 
 const (
@@ -239,8 +239,8 @@ func IsClaudeUsageURL(u *url.URL) bool {
 }
 
 func claudeUsageOrganizationBlocked(body []byte) bool {
-	return gjson.GetBytes(body, "error.details.error_code").String() == claudeOrganizationOAuthBlocked ||
-		gjson.GetBytes(body, "error.message").String() == claudeOrganizationOAuthMessage
+	return ojson.GetBytes(body, "error.details.error_code").String() == claudeOrganizationOAuthBlocked ||
+		ojson.GetBytes(body, "error.message").String() == claudeOrganizationOAuthMessage
 }
 
 func (m *Manager) fetchUsageObservation(ctx context.Context, auth *Auth) (usageObservation, error) {
@@ -294,16 +294,16 @@ func parseUsageObservation(provider string, body []byte) (usageObservation, erro
 			return observation, err
 		}
 		// Require both base windows; absent or malformed data cannot release a hold.
-		short := gjson.GetBytes(body, "five_hour.utilization")
-		long := gjson.GetBytes(body, "seven_day.utilization")
-		observation.available = short.Type == gjson.Number && short.Float() >= 0 && short.Float() < 100 && long.Type == gjson.Number && long.Float() >= 0 && long.Float() < 100
+		short := ojson.GetBytes(body, "five_hour.utilization")
+		long := ojson.GetBytes(body, "seven_day.utilization")
+		observation.available = short.Type == ojson.Number && short.Float() >= 0 && short.Float() < 100 && long.Type == ojson.Number && long.Float() >= 0 && long.Float() < 100
 		return observation, nil
 	}
 	observation.weeklyUsed, err = parseCodexWeeklyUsage(body)
 	if err != nil {
 		return observation, err
 	}
-	rate := firstGJSON(gjson.ParseBytes(body), "rate_limit", "rateLimit")
+	rate := firstGJSON(ojson.ParseBytes(body), "rate_limit", "rateLimit")
 	observation.signals = make(map[string]string)
 	observation.available = true
 	for _, entry := range []struct {
@@ -312,20 +312,20 @@ func parseUsageObservation(provider string, body []byte) (usageObservation, erro
 	}{{"primary", []string{"primary_window", "primaryWindow"}}, {"secondary", []string{"secondary_window", "secondaryWindow"}}} {
 		window := firstGJSON(rate, entry.keys...)
 		used := firstGJSON(window, "used_percent", "usedPercent")
-		if used.Type != gjson.Number || used.Float() < 0 || used.Float() >= 100 {
+		if used.Type != ojson.Number || used.Float() < 0 || used.Float() >= 100 {
 			observation.available = false
 		}
-		if used.Type == gjson.Number {
+		if used.Type == ojson.Number {
 			observation.signals[http.CanonicalHeaderKey("x-codex-"+entry.name+"-used-percent")] = used.Raw
 		}
-		if reset := firstGJSON(window, "reset_at", "resetAt"); reset.Type == gjson.Number {
+		if reset := firstGJSON(window, "reset_at", "resetAt"); reset.Type == ojson.Number {
 			observation.signals[http.CanonicalHeaderKey("x-codex-"+entry.name+"-reset-at")] = reset.Raw
 		}
 	}
-	if allowed := firstGJSON(rate, "allowed"); allowed.Type == gjson.False {
+	if allowed := firstGJSON(rate, "allowed"); allowed.Type == ojson.False {
 		observation.available = false
 	}
-	if reached := firstGJSON(rate, "limit_reached", "limitReached"); reached.Type == gjson.True {
+	if reached := firstGJSON(rate, "limit_reached", "limitReached"); reached.Type == ojson.True {
 		observation.available = false
 	}
 	return observation, nil

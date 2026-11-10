@@ -7,10 +7,9 @@ import (
 	"net/http"
 	"time"
 
+	"github.com/MoeForge/moego/ojson"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/registry"
-	"github.com/tidwall/gjson"
-	"github.com/tidwall/sjson"
 )
 
 const recoveryTicketTTL = 24 * time.Hour
@@ -67,10 +66,10 @@ func RecoveryMarker(err error) string {
 
 func appendRecoveryMarker(message, id string) string {
 	marker := " [cliproxy-recovery:" + id + "]"
-	if gjson.Valid(message) {
+	if ojson.Valid(message) {
 		for _, path := range []string{"error.message", "message"} {
-			if value := gjson.Get(message, path); value.Type == gjson.String {
-				if result, err := sjson.Set(message, path, value.String()+marker); err == nil {
+			if value := ojson.Get(message, path); value.Type == ojson.String {
+				if result, err := ojson.Set(message, path, value.String()+marker); err == nil {
 					return result
 				}
 			}

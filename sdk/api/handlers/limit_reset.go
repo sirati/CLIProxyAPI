@@ -7,9 +7,9 @@ import (
 	"strings"
 	"time"
 
+	"github.com/MoeForge/moego/ojson"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/interfaces"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
-	"github.com/tidwall/gjson"
 )
 
 // A client resumes a conversation stopped by a usage limit once the reset it
@@ -75,7 +75,7 @@ func (h *BaseAPIHandler) LimitReset(msg *interfaces.ErrorMessage, provider strin
 		bodies = append(bodies, []byte(msg.Error.Error()))
 	}
 	for _, body := range bodies {
-		for _, quota := range []gjson.Result{gjson.GetBytes(body, "error"), gjson.ParseBytes(body)} {
+		for _, quota := range []ojson.Result{ojson.GetBytes(body, "error"), ojson.ParseBytes(body)} {
 			if resetsAt := quota.Get("resets_at").Int(); resetsAt > 0 {
 				earlier(time.Unix(resetsAt, 0).Sub(now))
 			}
