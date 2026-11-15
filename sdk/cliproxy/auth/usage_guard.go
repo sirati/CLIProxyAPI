@@ -355,6 +355,14 @@ func (m *Manager) checkUsageGuard(ctx context.Context, guard *usageGuard, auth *
 		}
 		return false
 	}
+	return m.applyUsageCheck(ctx, guard, auth, settings, observation)
+}
+
+// applyUsageCheck acts on a fresh usage observation of auth, the snapshot taken
+// before the usage request: it lifts quota cooldowns the observation disproves,
+// clears a subscription lapse and applies the credential's guard settings. It
+// reports whether a Codex usage reset was seen.
+func (m *Manager) applyUsageCheck(ctx context.Context, guard *usageGuard, auth *Auth, settings usageGuardSettings, observation usageObservation) bool {
 	guard.clearUsageFailure(auth.ID)
 	reset := guard.observeCodexUsage(auth, observation.signals)
 	m.applyUsageObservation(ctx, auth, observation)

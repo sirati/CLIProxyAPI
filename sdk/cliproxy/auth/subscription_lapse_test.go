@@ -64,10 +64,14 @@ func lapsedClaude(id string) *Auth {
 func newLapseManager(t *testing.T, model string, auths ...*Auth) (*Manager, *lapseExecutor) {
 	t.Helper()
 	m := NewManager(nil, &FillFirstSelector{}, nil)
+	m.usageGuard = &usageGuard{cancel: func() {}, holds: map[string]time.Time{}, wake: make(chan string, 1)}
 	e := &lapseExecutor{calls: map[string]int{}, lapsed: map[string]bool{}, fail: map[string]*Error{}}
 	m.RegisterExecutor(e)
 	reg := registry.GetGlobalRegistry()
 	for _, auth := range auths {
+		if authAccessToken(auth) == "" {
+			auth.Metadata["access_token"] = "lapse-test-token-" + auth.ID
+		}
 		if _, err := m.Register(context.Background(), auth); err != nil {
 			t.Fatal(err)
 		}
@@ -149,24 +153,30 @@ func TestClaudeSubscriptionLapseFromRequestStopsRouting(t *testing.T) {
 	}
 }
 
-func TestObserveClaudeUsageCheckSetsAndClearsLapse(t *testing.T) {
+func TestObserveUsageCheckSetsAndClearsLapse(t *testing.T) {
 	model := "lapse-observe-model-" + t.Name()
 	a := &Auth{ID: "claude-observe", Provider: "claude", Status: StatusActive, Metadata: map[string]any{}}
 	m, _ := newLapseManager(t, model, a)
 	ctx := context.Background()
+	usageURL, _ := url.Parse(claudeUsageURL)
+	observe := func(status int, body string) {
+		t.Helper()
+		before, _ := m.GetByID(a.ID)
+		m.ObserveUsageCheck(ctx, before, usageURL, status, []byte(body))
+	}
 
 	m.MarkResult(ctx, Result{AuthID: a.ID, Provider: "claude", Model: model, Error: &Error{HTTPStatus: http.StatusForbidden, Message: lapsedUsageBody}})
 	for _, tc := range []struct {
 		status int
 		body   string
 	}{{http.StatusTooManyRequests, `{"error":{"type":"rate_limit_error"}}`}, {http.StatusOK, `{`}, {http.StatusOK, `{"five_hour":{}}`}} {
-		m.ObserveClaudeUsageCheck(ctx, a.ID, tc.status, []byte(tc.body))
+		observe(tc.status, tc.body)
 		if current, _ := m.GetByID(a.ID); !ClaudeSubscriptionLapsed(current) {
 			t.Fatalf("inconclusive usage response %d %s cleared the lapse", tc.status, tc.body)
 		}
 	}
 
-	m.ObserveClaudeUsageCheck(ctx, a.ID, http.StatusOK, []byte(availableUsage("claude")))
+	observe(http.StatusOK, availableUsage("claude"))
 	current, _ := m.GetByID(a.ID)
 	if ClaudeSubscriptionLapsed(current) || current.LastError != nil {
 		t.Fatalf("renewed subscription still lapsed: %+v", current)
@@ -176,7 +186,7 @@ func TestObserveClaudeUsageCheckSetsAndClearsLapse(t *testing.T) {
 		t.Fatalf("renewed subscription not routed: %v, %v", picked, err)
 	}
 
-	m.ObserveClaudeUsageCheck(ctx, a.ID, http.StatusForbidden, []byte(lapsedUsageBody))
+	observe(http.StatusForbidden, lapsedUsageBody)
 	if current, _ = m.GetByID(a.ID); !ClaudeSubscriptionLapsed(current) {
 		t.Fatal("manual usage check did not record the lapse")
 	}
@@ -191,16 +201,24 @@ func TestObserveClaudeUsageCheckSetsAndClearsLapse(t *testing.T) {
 	}
 }
 
-func TestIsClaudeUsageURL(t *testing.T) {
-	for raw, want := range map[string]bool{
-		"https://api.anthropic.com/api/oauth/usage":     true,
-		"https://API.anthropic.com:443/api/oauth/usage": true,
-		"https://api.anthropic.com/api/oauth/profile":   false,
-		"https://example.com/api/oauth/usage":           false,
+func TestIsUsageURL(t *testing.T) {
+	for _, tc := range []struct {
+		provider, raw string
+		want          bool
+	}{
+		{"claude", "https://api.anthropic.com/api/oauth/usage", true},
+		{"claude", "https://API.anthropic.com:443/api/oauth/usage/", true},
+		{"claude", "https://api.anthropic.com/api/oauth/profile", false},
+		{"claude", "https://example.com/api/oauth/usage", false},
+		{"claude", "http://api.anthropic.com/api/oauth/usage", false},
+		{"claude", "https://chatgpt.com/backend-api/wham/usage", false},
+		{"codex", "https://chatgpt.com/backend-api/wham/usage", true},
+		{"codex", "https://api.anthropic.com/api/oauth/usage", false},
+		{"gemini", "https://api.anthropic.com/api/oauth/usage", false},
 	} {
-		u, _ := url.Parse(raw)
-		if got := IsClaudeUsageURL(u); got != want {
-			t.Fatalf("IsClaudeUsageURL(%s) = %v, want %v", raw, got, want)
+		u, _ := url.Parse(tc.raw)
+		if got := IsUsageURL(tc.provider, u); got != tc.want {
+			t.Fatalf("IsUsageURL(%s, %s) = %v, want %v", tc.provider, tc.raw, got, tc.want)
 		}
 	}
 }

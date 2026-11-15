@@ -212,30 +212,55 @@ func (m *Manager) setClaudeSubscriptionLapse(ctx context.Context, authID string,
 	}
 }
 
-// ObserveClaudeUsageCheck records what a Claude usage request made outside the
-// poller, such as the management panel's refresh, says about the subscription.
-func (m *Manager) ObserveClaudeUsageCheck(ctx context.Context, authID string, status int, body []byte) {
-	if m == nil {
+// ObserveUsageCheck applies a usage response fetched outside the poller, such
+// as the management panel's usage refresh, as a poller check would: usage that
+// is back lifts the quota cooldown, which also releases recovery waits, and a
+// Claude subscription lapse is recorded or cleared. before is the credential
+// as it was when the usage request was sent, so a failure recorded after that
+// request is not lifted by the older observation.
+func (m *Manager) ObserveUsageCheck(ctx context.Context, before *Auth, target *url.URL, status int, body []byte) {
+	if m == nil || before == nil || !IsUsageURL(before.Provider, target) {
 		return
 	}
-	auth, ok := m.GetByID(authID)
-	if !ok || !strings.EqualFold(auth.Provider, "claude") {
+	if status == http.StatusForbidden && strings.EqualFold(before.Provider, "claude") && claudeUsageOrganizationBlocked(body) {
+		m.setClaudeSubscriptionLapse(ctx, before.ID, true)
 		return
 	}
-	if status == http.StatusForbidden && claudeUsageOrganizationBlocked(body) {
-		m.setClaudeSubscriptionLapse(ctx, authID, true)
+	now := time.Now()
+	if status < 200 || status >= 300 || !automaticUsageEligible(before, now) {
 		return
 	}
-	if status >= 200 && status < 300 && ClaudeSubscriptionLapsed(auth) {
-		if _, errParse := parseUsageObservation(auth.Provider, body); errParse == nil {
-			m.setClaudeSubscriptionLapse(ctx, authID, false)
-		}
+	observation, errParse := parseUsageObservation(before.Provider, body)
+	if errParse != nil {
+		return
+	}
+	m.mu.RLock()
+	guard := m.usageGuard
+	m.mu.RUnlock()
+	if guard == nil {
+		return // Not running locally, for example during a handoff.
+	}
+	guard.recordUsageCheck(before.ID, now)
+	settings, _ := usageGuardSettingsOf(before)
+	if m.applyUsageCheck(ctx, guard, before, settings, observation) {
+		m.wakeCodexUsagePeers(before.ID)
 	}
 }
 
-// IsClaudeUsageURL reports whether u is the Claude OAuth usage endpoint.
-func IsClaudeUsageURL(u *url.URL) bool {
-	return u != nil && strings.EqualFold(u.Hostname(), "api.anthropic.com") && strings.TrimSuffix(u.Path, "/") == "/api/oauth/usage"
+// IsUsageURL reports whether u is the OAuth usage endpoint of provider.
+func IsUsageURL(provider string, u *url.URL) bool {
+	if u == nil {
+		return false
+	}
+	want := claudeUsageURL
+	if strings.EqualFold(provider, "codex") {
+		want = codexUsageURL
+	} else if !strings.EqualFold(provider, "claude") {
+		return false
+	}
+	usage, _ := url.Parse(want)
+	return strings.EqualFold(u.Scheme, "https") && strings.EqualFold(u.Hostname(), usage.Hostname()) &&
+		strings.TrimSuffix(u.Path, "/") == usage.Path
 }
 
 func claudeUsageOrganizationBlocked(body []byte) bool {

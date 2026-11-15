@@ -215,6 +215,13 @@ func (h *Handler) APICall(c *gin.Context) {
 	}
 	httpClient.Transport = h.apiCallTransport(auth, requestProxyURL)
 
+	// Snapshot the credential after any token refresh above and before the
+	// request, so its usage response cannot lift a cooldown recorded later.
+	var usageBefore *coreauth.Auth
+	if auth != nil && h.authManager != nil && method == http.MethodGet && coreauth.IsUsageURL(auth.Provider, parsedURL) {
+		usageBefore, _ = h.authManager.GetByID(auth.ID)
+	}
+
 	resp, errDo := httpClient.Do(req)
 	if errDo != nil {
 		log.WithError(errDo).Debug("management APICall request failed")
@@ -232,10 +239,11 @@ func (h *Handler) APICall(c *gin.Context) {
 		c.JSON(http.StatusBadGateway, gin.H{"error": "failed to read response"})
 		return
 	}
-	// The panel's Claude usage refresh doubles as a subscription check: it can
-	// confirm a lapse or resume routing to a renewed subscription.
-	if auth != nil && h.authManager != nil && method == http.MethodGet && coreauth.IsClaudeUsageURL(parsedURL) {
-		h.authManager.ObserveClaudeUsageCheck(c.Request.Context(), auth.ID, resp.StatusCode, respBody)
+	// The panel's usage refresh counts as a usage check: usage that is back
+	// lifts the quota cooldown, and a Claude subscription lapse is recorded or
+	// cleared.
+	if usageBefore != nil {
+		h.authManager.ObserveUsageCheck(c.Request.Context(), usageBefore, parsedURL, resp.StatusCode, respBody)
 	}
 
 	c.JSON(http.StatusOK, apiCallResponse{
