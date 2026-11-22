@@ -27,7 +27,14 @@ func matchProvider(provider string, targets []string) (string, bool) {
 }
 
 func (w *Watcher) start(ctx context.Context) error {
-	if errAddConfig := w.watcher.Add(w.configPath); errAddConfig != nil {
+	// Watch the config file's directory: a watch on the file follows its inode
+	// and is lost when an editor or `mv` replaces the file. handleEvent keeps
+	// only events for the config path.
+	if _, errStat := os.Stat(w.configPath); errStat != nil {
+		log.Errorf("failed to watch config file %s: %v", w.configPath, errStat)
+		return errStat
+	}
+	if errAddConfig := w.watcher.Add(filepath.Dir(w.configPath)); errAddConfig != nil {
 		log.Errorf("failed to watch config file %s: %v", w.configPath, errAddConfig)
 		return errAddConfig
 	}
@@ -65,7 +72,7 @@ func (w *Watcher) syncAuthDirWatch() {
 	if oldWatched == target {
 		return
 	}
-	if oldWatched != "" && !w.sameNormalizedAuthPath(oldWatched, w.configPath) && !w.sameNormalizedAuthPath(oldWatched, target) {
+	if oldWatched != "" && !w.sameNormalizedAuthPath(oldWatched, filepath.Dir(w.configPath)) && !w.sameNormalizedAuthPath(oldWatched, target) {
 		if errRemove := w.watcher.Remove(oldWatched); errRemove != nil {
 			log.Debugf("failed to remove previous auth directory watch %s: %v", oldWatched, errRemove)
 		}

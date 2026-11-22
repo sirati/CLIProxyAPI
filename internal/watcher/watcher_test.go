@@ -262,6 +262,51 @@ func TestStartAndStopSuccess(t *testing.T) {
 	}
 }
 
+// Editors and `mv` replace config.yaml with a new file. The watch must follow
+// the path, not the replaced file, so every replacement reloads.
+func TestConfigReloadSurvivesAtomicReplace(t *testing.T) {
+	tmpDir := t.TempDir()
+	authDir := filepath.Join(tmpDir, "auth")
+	if err := os.MkdirAll(authDir, 0o755); err != nil {
+		t.Fatalf("failed to create auth dir: %v", err)
+	}
+	configPath := filepath.Join(tmpDir, "config.yaml")
+	if err := os.WriteFile(configPath, []byte("auth-dir: "+authDir+"\nport: 9001\n"), 0o644); err != nil {
+		t.Fatalf("failed to create config file: %v", err)
+	}
+	ports := make(chan int, 8)
+	w, err := NewWatcher(configPath, authDir, func(cfg *config.Config) { ports <- cfg.Port })
+	if err != nil {
+		t.Fatalf("failed to create watcher: %v", err)
+	}
+	w.SetConfig(&config.Config{AuthDir: authDir})
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	if err := w.Start(ctx); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	defer func() { _ = w.Stop() }()
+	<-ports // initial load
+
+	for _, port := range []int{9002, 9003} {
+		tmp := configPath + ".tmp"
+		if err := os.WriteFile(tmp, []byte(fmt.Sprintf("auth-dir: %s\nport: %d\n", authDir, port)), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Rename(tmp, configPath); err != nil {
+			t.Fatal(err)
+		}
+		deadline := time.After(10 * time.Second)
+		for got := 0; got != port; {
+			select {
+			case got = <-ports:
+			case <-deadline:
+				t.Fatalf("no reload after replacing config with port %d", port)
+			}
+		}
+	}
+}
+
 func TestStartFailsWhenConfigMissing(t *testing.T) {
 	tmpDir := t.TempDir()
 	authDir := filepath.Join(tmpDir, "auth")
