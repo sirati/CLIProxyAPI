@@ -99,6 +99,47 @@ func excludeExecutionProvider(providers []string, excluded string) []string {
 	return out
 }
 
+// levelVariantOrder lists thinking levels from lowest to highest.
+var levelVariantOrder = []thinking.ThinkingLevel{
+	thinking.LevelMinimal, thinking.LevelLow, thinking.LevelMedium,
+	thinking.LevelHigh, thinking.LevelXHigh, thinking.LevelMax,
+}
+
+// levelVariantModel maps a model name that is not registered to a registered
+// "<name>-<level>" variant. Some catalogs, like Antigravity's, name one model
+// per thinking level, while the public Gemini API names the model and puts the
+// level in the request. The variant matching the request's level wins, else
+// the highest one; the request's thinking setting still applies to it.
+func (h *BaseAPIHandler) levelVariantModel(modelName, entryProtocol string, rawJSON []byte) string {
+	if h != nil && h.AuthManager != nil && h.AuthManager.HomeEnabled() {
+		return modelName
+	}
+	parsed := thinking.ParseSuffix(modelName)
+	base := strings.TrimSpace(parsed.ModelName)
+	if base == "" || len(util.GetProviderName(base)) > 0 {
+		return modelName
+	}
+	want := thinking.ThinkingLevel(thinking.ExtractReasoningEffort(rawJSON, entryProtocol, modelName))
+	variant := ""
+	for _, level := range levelVariantOrder {
+		candidate := base + "-" + string(level)
+		if len(util.GetProviderName(candidate)) == 0 {
+			continue
+		}
+		variant = candidate
+		if level == want {
+			break
+		}
+	}
+	if variant == "" {
+		return modelName
+	}
+	if parsed.HasSuffix {
+		return variant + "(" + parsed.RawSuffix + ")"
+	}
+	return variant
+}
+
 func (h *BaseAPIHandler) getRequestDetails(modelName string) (providers []string, normalizedModel string, err *interfaces.ErrorMessage) {
 	return h.getRequestDetailsWithOptions(modelName, false, false)
 }

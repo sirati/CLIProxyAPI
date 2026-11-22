@@ -31,6 +31,7 @@ func (h *BaseAPIHandler) HasAlternativeExecutionTarget(ctx context.Context, hand
 		return false
 	}
 	originalRequestedModel := modelName
+	modelName = h.levelVariantModel(modelName, handlerType, rawJSON)
 	execOptions := modelExecutionOptions{
 		AllowSpeechModel: isModelExecutionSpeechProtocol(handlerType),
 	}
@@ -350,6 +351,7 @@ func (h *BaseAPIHandler) executeStreamWithAuthManager(ctx context.Context, handl
 
 func (h *BaseAPIHandler) executeStreamWithAuthManagerFormats(ctx context.Context, entryProtocol, exitProtocol, modelName string, rawJSON []byte, alt string, allowImageModel bool, execOptions modelExecutionOptions) (<-chan []byte, http.Header, <-chan *interfaces.ErrorMessage) {
 	originalRequestedModel := modelName
+	modelName = h.levelVariantModel(modelName, entryProtocol, rawJSON)
 	// Speech-only models are reachable solely through the speech entry protocol.
 	execOptions.AllowSpeechModel = isModelExecutionSpeechProtocol(entryProtocol)
 	routeDecision, preparedRoute := preparedModelRouteFromContext(ctx, execOptions.SkipRouterPluginID)

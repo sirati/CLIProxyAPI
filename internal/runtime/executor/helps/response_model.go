@@ -330,6 +330,13 @@ func IsModelSubstituted(requested, served string) bool {
 	if reqNoLatest == srvNoLatest {
 		return false
 	}
+	// Antigravity names a model per thinking level ("gemini-4-neon-xhigh") but
+	// reports the model itself ("gemini-4-neon") as served.
+	if level, ok := strings.CutPrefix(cleanReq, cleanSrv+"-"); ok {
+		if _, isLevel := thinking.ParseLevelSuffix(level); isLevel {
+			return false
+		}
+	}
 	if isDatedModelAlias(reqNoLatest, srvNoLatest) || isDatedModelAlias(srvNoLatest, reqNoLatest) {
 		return false
 	}
