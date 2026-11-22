@@ -103,6 +103,12 @@ type BoltStore struct {
 // OpenBoltStore resolves path, creates parent directories, opens the bbolt file,
 // ensures the KV bucket exists, and starts the background expiration sweeper.
 func OpenBoltStore(path string, opts ...BoltStoreOption) (*BoltStore, error) {
+	return openBoltStore(path, defaultBoltOpenTimeout, opts...)
+}
+
+// openBoltStore waits at most lockTimeout for another process to release the
+// database file; bbolt then returns an error wrapping bbolt.ErrTimeout.
+func openBoltStore(path string, lockTimeout time.Duration, opts ...BoltStoreOption) (*BoltStore, error) {
 	resolvedPath, errResolve := ResolvePath(path)
 	if errResolve != nil {
 		return nil, errResolve
@@ -110,7 +116,7 @@ func OpenBoltStore(path string, opts ...BoltStoreOption) (*BoltStore, error) {
 	if errMkdir := os.MkdirAll(filepath.Dir(resolvedPath), 0o755); errMkdir != nil {
 		return nil, fmt.Errorf("kvstore: create parent directory: %w", errMkdir)
 	}
-	db, errOpen := bbolt.Open(resolvedPath, 0o600, &bbolt.Options{Timeout: defaultBoltOpenTimeout})
+	db, errOpen := bbolt.Open(resolvedPath, 0o600, &bbolt.Options{Timeout: lockTimeout})
 	if errOpen != nil {
 		return nil, fmt.Errorf("kvstore: open bolt db: %w", errOpen)
 	}

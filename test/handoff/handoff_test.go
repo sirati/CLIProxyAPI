@@ -182,6 +182,46 @@ func (e *proxyEnv) waitServing() {
 	e.t.Fatal("service did not start")
 }
 
+// waitKVOwner waits until pid holds the lock on the service's kv.db. Every
+// service opens it; the process serving must own it, even while its
+// predecessor still drains.
+func (e *proxyEnv) waitKVOwner(pid int) {
+	e.t.Helper()
+	path := filepath.Join(e.dir, "auth", "kv.db")
+	deadline := time.Now().Add(10 * time.Second)
+	owner := 0
+	for time.Now().Before(deadline) {
+		if owner = flockOwner(path); owner == pid {
+			return
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	e.dumpLogs()
+	e.t.Fatalf("kv.db lock owner = %d, want %d", owner, pid)
+}
+
+// flockOwner reads the pid holding an exclusive flock on path from /proc/locks.
+func flockOwner(path string) int {
+	var st syscall.Stat_t
+	if syscall.Stat(path, &st) != nil {
+		return 0
+	}
+	locks, err := os.ReadFile("/proc/locks")
+	if err != nil {
+		return 0
+	}
+	for _, line := range strings.Split(string(locks), "\n") {
+		// 1: FLOCK  ADVISORY  WRITE 4242 00:2b:1234 0 EOF
+		fields := strings.Fields(line)
+		if len(fields) < 6 || fields[1] != "FLOCK" || fields[3] != "WRITE" || !strings.HasSuffix(fields[5], ":"+strconv.FormatUint(st.Ino, 10)) {
+			continue
+		}
+		pid, _ := strconv.Atoi(fields[4])
+		return pid
+	}
+	return 0
+}
+
 func alive(pid int) bool {
 	if syscall.Kill(pid, 0) != nil {
 		return false
@@ -321,10 +361,13 @@ func TestUpgradeKeepsEveryConnection(t *testing.T) {
 	}()
 	time.Sleep(500 * time.Millisecond)
 
+	env.waitKVOwner(first)
 	second := env.upgrade()
 	if second == first {
 		t.Fatal("upgrade reported the old pid")
 	}
+	// The first process drains for a while; the store moves over at once.
+	env.waitKVOwner(second)
 
 	stream := <-streamDone
 	if stream.err != nil || !strings.Contains(stream.body, "[29|") || !strings.Contains(stream.body, "message_stop") {
@@ -348,6 +391,7 @@ func TestUpgradeKeepsEveryConnection(t *testing.T) {
 
 	// A second upgrade: the middle process passes the stream on and leaves.
 	third := env.upgrade()
+	env.waitKVOwner(third)
 	if got := turn(t, codexSession, "three"); got != "conn=1 turn=3" {
 		t.Fatalf("turn 3 after the second upgrade: %q", got)
 	}
@@ -392,7 +436,8 @@ func TestFailedTakeoverLeavesTheServiceRunning(t *testing.T) {
 	if !alive(first) {
 		t.Fatal("the running service exited")
 	}
-	// It took everything back: the listener, its decisions, its connections.
+	// It took everything back: the store, the listener, its decisions, its connections.
+	env.waitKVOwner(first)
 	body, reused, err := claudeStream(keepAlive, messages, "still here")
 	if err != nil || !reused || !strings.Contains(body, "message_stop") {
 		t.Fatalf("keep-alive connection after a failed upgrade: reused=%v err=%v %q", reused, err, body)
@@ -403,6 +448,7 @@ func TestFailedTakeoverLeavesTheServiceRunning(t *testing.T) {
 
 	// And a later upgrade still works.
 	second := env.upgrade()
+	env.waitKVOwner(second)
 	if body, reused, err := claudeStream(keepAlive, messages, "moved"); err != nil || !reused || !strings.Contains(body, "message_stop") {
 		t.Fatalf("keep-alive connection after the real upgrade: reused=%v err=%v", reused, err)
 	}

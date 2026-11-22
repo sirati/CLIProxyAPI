@@ -24,6 +24,20 @@ func (s *Service) applyKVStoreConfig(cfg *config.Config) {
 	_ = kvstore.ConfigureLocal(true, cfg.EffectiveKVStorePath())
 }
 
+// releaseKVStoreForHandoff closes the local store so the process taking over
+// can open it; this process finishes its requests with in-memory storage.
+// It reports whether the store must be reopened if the takeover fails.
+func (s *Service) releaseKVStoreForHandoff() bool {
+	// A config reload in this process must not take the store back.
+	if s == nil || !s.kvStoreManaged.Swap(false) {
+		return false
+	}
+	if errShutdown := kvstore.ShutdownLocal(); errShutdown != nil {
+		log.Errorf("handoff: releasing local kv store: %v", errShutdown)
+	}
+	return true
+}
+
 func (s *Service) shutdownKVStore() error {
 	if s == nil {
 		return nil

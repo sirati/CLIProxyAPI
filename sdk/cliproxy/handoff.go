@@ -405,8 +405,12 @@ func (s *Service) serveTakeover(ctx context.Context, conn *sdkhandoff.Conn, cont
 	sink := &handoffSink{conn: conn, peer: peer}
 	handoff.Freeze(sink)
 	thaw := s.coreManager.FreezeForHandoff()
+	kvReleased := false
 	rollback := func(err error, listenerFile *os.File) bool {
 		handoff.Unfreeze()
+		if kvReleased {
+			s.applyKVStoreConfig(s.currentConfig())
+		}
 		if listenerFile != nil {
 			if errRestore := s.server.RestoreListener(listenerFile); errRestore != nil {
 				log.Errorf("handoff: taking the listener back failed: %v", errRestore)
@@ -439,6 +443,9 @@ func (s *Service) serveTakeover(ctx context.Context, conn *sdkhandoff.Conn, cont
 		_ = sink.Send(sdkhandoff.KindStateAffinity, "", s.coreManager.ExportHandoffAffinity())
 	}
 	_ = sink.Send(sdkhandoff.KindStateUsageQueue, "", redisqueue.ExportHandoffQueue())
+	// The new process waits for the kv.db lock; it may open the file once the
+	// state is complete.
+	kvReleased = s.releaseKVStoreForHandoff()
 	if errEnd := conn.Send(sdkhandoff.Message{Type: sdkhandoff.TypeStateEnd}); errEnd != nil {
 		return rollback(errEnd, keep)
 	}

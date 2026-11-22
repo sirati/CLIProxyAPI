@@ -6,6 +6,8 @@ import (
 	"path/filepath"
 	"testing"
 	"time"
+
+	"go.etcd.io/bbolt"
 )
 
 func resetControllerForTest(t *testing.T) {
@@ -212,5 +214,90 @@ func TestControllerHelpersWithLocalBoltStore(t *testing.T) {
 	var afterDel payload
 	if _, foundAfterDel := KVGetJSONBestEffort(ctx, "cpa:test:json", &afterDel); foundAfterDel {
 		t.Fatalf("KVGetJSONBestEffort() found deleted key")
+	}
+}
+
+// holdBoltLock opens path the way a draining predecessor process holds it.
+func holdBoltLock(t *testing.T, path string) *bbolt.DB {
+	t.Helper()
+	db, err := bbolt.Open(path, 0o600, &bbolt.Options{Timeout: time.Second})
+	if err != nil {
+		t.Fatalf("hold %s: %v", path, err)
+	}
+	return db
+}
+
+func waitForLocalStore(t *testing.T) *BoltStore {
+	t.Helper()
+	deadline := time.After(10 * time.Second)
+	tick := time.NewTicker(10 * time.Millisecond)
+	defer tick.Stop()
+	for {
+		if client, kvMode, err := CurrentKVClient(); err == nil && kvMode && client != nil {
+			return client.(*BoltStore)
+		}
+		select {
+		case <-tick.C:
+		case <-deadline:
+			t.Fatal("local store did not open after the lock was released")
+		}
+	}
+}
+
+func shortLockTimeouts(t *testing.T) {
+	t.Helper()
+	open, retry := localOpenTimeout, localRetryTimeout
+	localOpenTimeout, localRetryTimeout = 20*time.Millisecond, 20*time.Millisecond
+	t.Cleanup(func() { localOpenTimeout, localRetryTimeout = open, retry })
+}
+
+func TestControllerWaitsForLockedStoreWithInMemoryFallback(t *testing.T) {
+	resetControllerForTest(t)
+	shortLockTimeouts(t)
+	path := filepath.Join(t.TempDir(), "kv.db")
+	holder := holdBoltLock(t, path)
+
+	if err := ConfigureLocal(true, path); err != nil {
+		t.Fatalf("ConfigureLocal() with a locked file = %v, want nil", err)
+	}
+	if client, kvMode, err := CurrentKVClient(); client != nil || kvMode || err != nil {
+		t.Fatalf("CurrentKVClient() while locked = (%v, %v, %v), want in-memory (nil, false, nil)", client, kvMode, err)
+	}
+	// Reconfiguring the same path keeps waiting instead of starting over.
+	if err := ConfigureLocal(true, path); err != nil {
+		t.Fatalf("ConfigureLocal() again = %v", err)
+	}
+
+	if err := holder.Close(); err != nil {
+		t.Fatal(err)
+	}
+	store := waitForLocalStore(t)
+	if _, err := store.KVSet(context.Background(), "k", []byte("v"), KVSetOptions{}); err != nil {
+		t.Fatalf("KVSet() after the lock moved: %v", err)
+	}
+}
+
+func TestControllerShutdownStopsWaitingForLock(t *testing.T) {
+	resetControllerForTest(t)
+	shortLockTimeouts(t)
+	path := filepath.Join(t.TempDir(), "kv.db")
+	holder := holdBoltLock(t, path)
+	if err := ConfigureLocal(true, path); err != nil {
+		t.Fatal(err)
+	}
+	if err := ShutdownLocal(); err != nil {
+		t.Fatal(err)
+	}
+	if err := holder.Close(); err != nil {
+		t.Fatal(err)
+	}
+	// The stopped retry must not keep or take the file: this process can open
+	// it again, and the store stays off until reconfigured.
+	reopened := holdBoltLock(t, path)
+	if err := reopened.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if client, kvMode, err := CurrentKVClient(); client != nil || kvMode || err != nil {
+		t.Fatalf("CurrentKVClient() after shutdown = (%v, %v, %v), want (nil, false, nil)", client, kvMode, err)
 	}
 }
