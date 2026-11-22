@@ -51,6 +51,20 @@ func (h *ClaudeCodeAPIHandler) writeLimitResponse(c *gin.Context, msg *interface
 	}})
 
 	appendClaudeAPIResponse(c, body)
+	// Clients that do read Anthropic's headers also get the synthesized
+	// anthropic-ratelimit-unified-* window, under the usual passthrough rules.
+	// Retry-After stays the pool-wide reset written below.
+	if msg.Addon != nil && handlers.PassthroughHeadersEnabled(h.CurrentConfig()) {
+		for key, values := range msg.Addon {
+			if len(values) == 0 || handlers.IsCPAReservedResponseHeader(key) || http.CanonicalHeaderKey(key) == "Retry-After" {
+				continue
+			}
+			c.Writer.Header().Del(key)
+			for _, value := range values {
+				c.Writer.Header().Add(key, value)
+			}
+		}
+	}
 	c.Header("Content-Type", "application/json")
 	c.Header("Retry-After", strconv.Itoa(int(reset.Seconds())))
 	c.Header("x-should-retry", "false")

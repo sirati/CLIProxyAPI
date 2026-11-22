@@ -26,6 +26,7 @@ import (
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/executor"
 	"github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/usage"
+	"github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginapi"
 	log "github.com/sirupsen/logrus"
 )
 
@@ -167,6 +168,40 @@ func (r *UsageReporter) SetStream(stream bool) {
 		return
 	}
 	r.stream = stream
+}
+
+// PluginExecutorType returns the canonical usage executor label for a plugin ID.
+func PluginExecutorType(pluginID string) string {
+	if id := strings.TrimSpace(pluginID); id != "" {
+		return "plugin:" + id
+	}
+	return ""
+}
+
+// ApplyPluginExecutorAttribution populates executorType and optional upstream credential
+// attribution fields for direct plugin executor dispatches and auth-backed plugin executors.
+// Already-populated AuthIndex and AuthType values (e.g. from coreauth.Auth) are preserved.
+func (r *UsageReporter) ApplyPluginExecutorAttribution(executorPluginID string, attr *pluginapi.UsageAttribution) {
+	if r == nil {
+		return
+	}
+	if r.executorType == "" {
+		if executorType := PluginExecutorType(executorPluginID); executorType != "" {
+			r.executorType = executorType
+		}
+	}
+	if attr == nil {
+		return
+	}
+	if v := strings.TrimSpace(attr.AuthIndex); v != "" && r.authIndex == "" {
+		r.authIndex = v
+	}
+	if v := strings.TrimSpace(attr.AuthType); v != "" && r.authType == "" {
+		r.authType = v
+	}
+	if v := strings.TrimSpace(attr.Source); v != "" {
+		r.source = v
+	}
 }
 
 // SetSessionHierarchy sets the explicit session and parent session identifiers.
@@ -347,9 +382,18 @@ func (r *UsageReporter) ResponseModel() string {
 	return r.responseModel
 }
 
+type usageExecutorTypeProvider interface {
+	UsageExecutorType() string
+}
+
 func ExecutorTypeName(executor any) string {
 	if executor == nil {
 		return ""
+	}
+	if custom, ok := executor.(usageExecutorTypeProvider); ok && custom != nil {
+		if name := strings.TrimSpace(custom.UsageExecutorType()); name != "" {
+			return name
+		}
 	}
 	executorType := reflect.TypeOf(executor)
 	for executorType.Kind() == reflect.Pointer {
@@ -1386,7 +1430,7 @@ func (b *StreamUsageBuffer) ObserveClaudeStream(line []byte) {
 		return
 	}
 	payload := jsonPayload(line)
-	if b.responseModel == "" && len(payload) > 0 {
+	if len(payload) > 0 {
 		if model, _ := extractClaudeResponseModelEvent(payload); model != "" {
 			b.responseModel = model
 		}

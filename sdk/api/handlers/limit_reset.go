@@ -44,6 +44,11 @@ func (h *BaseAPIHandler) LimitReset(msg *interfaces.ErrorMessage, provider strin
 	if msg == nil || msg.DirectResponse {
 		return 0, NoLimit
 	}
+	// A scheduler continuity plugin ended this turn and owns what the client
+	// sees; telling the client to retry or resume would undo its decision.
+	if coreauth.IsContinuityTerminatedError(msg.Error) {
+		return 0, NoLimit
+	}
 	now := time.Now()
 	reset, known := coreauth.ModelCooldownResetIn(msg.Error)
 	status := msg.StatusCode

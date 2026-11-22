@@ -287,6 +287,13 @@ func (l *authAutoRefreshLoop) handleDueAuth(ctx context.Context, now time.Time, 
 	}
 
 	if !shouldRefresh {
+		if !next.After(now) {
+			delay := l.interval
+			if delay <= 0 {
+				delay = refreshCheckInterval
+			}
+			next = now.Add(delay)
+		}
 		l.upsert(authID, next)
 		return
 	}
@@ -405,7 +412,7 @@ func nextRefreshCheckAt(now time.Time, auth *Auth, interval time.Duration) (time
 	if auth == nil {
 		return time.Time{}, false
 	}
-	if hasUnauthorizedAuthFailure(auth) || hasDisabledInvalidGrantFailure(auth) || hasRejectedRefreshToken(auth) {
+	if hasUnauthorizedAuthFailure(auth) || hasDisabledInvalidGrantFailure(auth) {
 		return time.Time{}, false
 	}
 

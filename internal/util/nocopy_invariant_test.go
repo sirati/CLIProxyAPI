@@ -3,9 +3,10 @@ package util
 import (
 	"os"
 	"path/filepath"
-	"regexp"
 	"strings"
 	"testing"
+
+	"github.com/MoeForge/moego/regexp"
 )
 
 // inPlaceSJSONTokens are the sjson knobs that let a write reuse the caller's
@@ -118,6 +119,7 @@ var reviewedInPlaceByteWrites = map[string]reviewedInPlaceByteWrite{
 	"internal/pluginstore/auth.go":                                  {1, "zeroes a locally built credential buffer after base64 encoding copied it out"},
 	"sdk/handoff/protocol.go":                                       {1, "copies a marshalled message into a freshly allocated frame"},
 	"internal/handoff/frames.go":                                    {1, "copies websocket header bytes into the tracker private fixed-size array"},
+	"sdk/cliproxy/auth/selector_weighted.go":                        {2, "shifts weightedPoolMember bookkeeping structs when inserting or removing members; no byte of any JSON payload is rewritten"},
 }
 
 // TestInPlaceByteWritesAreReviewed keeps the set of in-place byte writes small
