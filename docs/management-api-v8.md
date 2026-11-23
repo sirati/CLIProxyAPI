@@ -171,6 +171,7 @@ retain the corresponding business operation's fields.
 | `/server/latest-version` | GET | Get latest release information. |
 | `/requests/api-call` | POST | Make an authenticated upstream call. |
 | `/routing/cooldown/reset` | POST | Clear credential cooldown. |
+| `/routing/outage-backoff` | GET | List credentials and models whose held requests wait out an upstream outage: `{observed_at, backoffs: [{auth_index, model, interval_ms, next_retry_in_ms, waiting, probing}]}`. |
 | `/routing/model-definitions/<channel>` | GET | Get model definitions. |
 | `/observability/logs` | GET, DELETE | Read or clear application logs. |
 | `/observability/logs/errors` | GET | List error-log files. |
