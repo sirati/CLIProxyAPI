@@ -6,11 +6,14 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/MoeForge/moego/ojson"
 	"github.com/gin-gonic/gin"
 	internalconfig "github.com/router-for-me/CLIProxyAPI/v8/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/handoff"
@@ -39,12 +42,15 @@ func (e genaiTestError) RetryAfter() *time.Duration {
 	return &d
 }
 
-// scriptedGeminiExecutor answers stream call n (from 1) with script(n).
+var capacityError = genaiTestError{status: http.StatusServiceUnavailable, msg: "No capacity available for model on the server (MODEL_CAPACITY_EXHAUSTED)"}
+
+// scriptedGeminiExecutor answers stream call n (from 1) with script(n, payload).
 type scriptedGeminiExecutor struct {
-	id     string
-	script func(n int) (*coreexecutor.StreamResult, error)
-	mu     sync.Mutex
-	calls  int
+	id       string
+	script   func(n int) (*coreexecutor.StreamResult, error)
+	mu       sync.Mutex
+	calls    int
+	payloads [][]byte
 }
 
 func (e *scriptedGeminiExecutor) Identifier() string { return e.id }
@@ -53,10 +59,11 @@ func (e *scriptedGeminiExecutor) Execute(context.Context, *coreauth.Auth, coreex
 	return coreexecutor.Response{}, errors.New("not implemented")
 }
 
-func (e *scriptedGeminiExecutor) ExecuteStream(context.Context, *coreauth.Auth, coreexecutor.Request, coreexecutor.Options) (*coreexecutor.StreamResult, error) {
+func (e *scriptedGeminiExecutor) ExecuteStream(_ context.Context, _ *coreauth.Auth, req coreexecutor.Request, _ coreexecutor.Options) (*coreexecutor.StreamResult, error) {
 	e.mu.Lock()
 	e.calls++
 	n := e.calls
+	e.payloads = append(e.payloads, append([]byte(nil), req.Payload...))
 	e.mu.Unlock()
 	return e.script(n)
 }
@@ -65,6 +72,12 @@ func (e *scriptedGeminiExecutor) Calls() int {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	return e.calls
+}
+
+func (e *scriptedGeminiExecutor) Payload(n int) []byte {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return e.payloads[n-1]
 }
 
 func (*scriptedGeminiExecutor) Refresh(_ context.Context, auth *coreauth.Auth) (*coreauth.Auth, error) {
@@ -90,13 +103,31 @@ func streamOf(items ...coreexecutor.StreamChunk) *coreexecutor.StreamResult {
 
 const genaiTestChunk = `{"candidates":[{"content":{"role":"model","parts":[{"text":"pong"}]},"finishReason":"STOP","index":0}]}`
 
-// fastGenAIHold shortens the hold's waits for a test.
+func textChunk(text string) []byte {
+	doc := ojson.NewDoc([]byte(`{"candidates":[{"content":{"role":"model","parts":[{"text":""}]},"index":0}]}`))
+	_ = doc.Set("candidates.0.content.parts.0.text", text)
+	return doc.Bytes()
+}
+
+func sse(chunks ...[]byte) string {
+	var out strings.Builder
+	for _, chunk := range chunks {
+		out.WriteString("data: ")
+		out.Write(chunk)
+		out.WriteString("\n\n")
+	}
+	return out.String()
+}
+
+// fastGenAIHold shortens the hold's and the outage gate's waits for a test.
 func fastGenAIHold(t *testing.T, headerDeadline time.Duration) {
 	t.Helper()
 	deadline, first, maxWait := genaiHeaderDeadline, genaiFirstRetryWait, genaiMaxRetryWait
 	genaiHeaderDeadline, genaiFirstRetryWait, genaiMaxRetryWait = headerDeadline, time.Millisecond, 20*time.Millisecond
+	restoreGate := coreauth.SetOutageGateTimingForTest(time.Millisecond, 4*time.Millisecond)
 	t.Cleanup(func() {
 		genaiHeaderDeadline, genaiFirstRetryWait, genaiMaxRetryWait = deadline, first, maxWait
+		restoreGate()
 	})
 }
 
@@ -120,8 +151,10 @@ func newGenAITestRouter(t *testing.T, executor *scriptedGeminiExecutor, cooling 
 	return router, model
 }
 
+const genaiTestRequest = `{"contents":[{"role":"user","parts":[{"text":"hi"}]}]}`
+
 func serveGenAI(router *gin.Engine, model, userAgent string) *httptest.ResponseRecorder {
-	request := httptest.NewRequest(http.MethodPost, "/v1beta/models/"+model+":streamGenerateContent?alt=sse", strings.NewReader(`{"contents":[{"parts":[{"text":"hi"}]}]}`))
+	request := httptest.NewRequest(http.MethodPost, "/v1beta/models/"+model+":streamGenerateContent?alt=sse", strings.NewReader(genaiTestRequest))
 	request.Header.Set("Content-Type", "application/json")
 	request.Header.Set("User-Agent", userAgent)
 	recorder := httptest.NewRecorder()
@@ -129,20 +162,20 @@ func serveGenAI(router *gin.Engine, model, userAgent string) *httptest.ResponseR
 	return recorder
 }
 
-func TestGenAIStreamHoldsTransientFailuresUntilTheUpstreamAnswers(t *testing.T) {
+func TestGenAIStreamWaitsOutAnOutageUntilTheUpstreamAnswers(t *testing.T) {
 	fastGenAIHold(t, time.Hour)
 	failures := []error{
-		genaiTestError{status: http.StatusServiceUnavailable, msg: "No capacity available for model on the server"},
+		capacityError,
 		genaiTestError{status: http.StatusInternalServerError, msg: "internal error"},
-		errors.New(`Post "https://daily-cloudcode-pa.googleapis.com/v1internal": connection reset by peer`),
+		&url.Error{Op: "Post", URL: "https://daily-cloudcode-pa.googleapis.com/v1internal", Err: io.ErrUnexpectedEOF},
 	}
-	executor := &scriptedGeminiExecutor{id: "genai-hold-transient", script: func(n int) (*coreexecutor.StreamResult, error) {
+	executor := &scriptedGeminiExecutor{id: "genai-hold-outage", script: func(n int) (*coreexecutor.StreamResult, error) {
 		if n <= len(failures) {
 			return nil, failures[n-1]
 		}
 		return streamOf(coreexecutor.StreamChunk{Payload: []byte(genaiTestChunk)}), nil
 	}}
-	router, model := newGenAITestRouter(t, executor, false)
+	router, model := newGenAITestRouter(t, executor, true)
 
 	recorder := serveGenAI(router, model, genaiUserAgent)
 
@@ -157,23 +190,76 @@ func TestGenAIStreamHoldsTransientFailuresUntilTheUpstreamAnswers(t *testing.T) 
 	}
 }
 
-func TestGenAIStreamWaitsOutACredentialCooldown(t *testing.T) {
+// While a model is down, the requests waiting for it go out one at a time,
+// and when it comes back all of them are answered.
+func TestGenAIStreamOutageSendsOneRequestAtATime(t *testing.T) {
 	fastGenAIHold(t, time.Hour)
-	executor := &scriptedGeminiExecutor{id: "genai-hold-cooldown", script: func(n int) (*coreexecutor.StreamResult, error) {
-		if n == 1 {
-			return nil, genaiTestError{status: http.StatusServiceUnavailable, retryAfter: 50 * time.Millisecond, msg: "No capacity available for model on the server"}
+	var down atomic.Int32
+	down.Store(12)
+	const clients = 4
+	var inFlight, maxInFlight atomic.Int32
+	allSent := make(chan struct{})
+	executor := &scriptedGeminiExecutor{id: "genai-hold-one-at-a-time", script: func(n int) (*coreexecutor.StreamResult, error) {
+		// The first calls all go out while the gate is open; every later one
+		// is a request the gate let through. Once the model is back the gate
+		// opens and lets everything waiting go at once.
+		if n <= clients {
+			if n == clients {
+				close(allSent)
+			}
+			<-allSent
+		} else if down.Load() > 0 {
+			now := inFlight.Add(1)
+			defer inFlight.Add(-1)
+			for {
+				seen := maxInFlight.Load()
+				if now <= seen || maxInFlight.CompareAndSwap(seen, now) {
+					break
+				}
+			}
+		}
+		time.Sleep(2 * time.Millisecond)
+		if down.Add(-1) >= 0 {
+			return nil, capacityError
 		}
 		return streamOf(coreexecutor.StreamChunk{Payload: []byte(genaiTestChunk)}), nil
 	}}
 	router, model := newGenAITestRouter(t, executor, true)
 
+	var wg sync.WaitGroup
+	for i := 0; i < clients; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if recorder := serveGenAI(router, model, genaiUserAgent); recorder.Body.String() != "data: "+genaiTestChunk+"\n\n" {
+				t.Errorf("status = %d body = %q, want the answer", recorder.Code, recorder.Body.String())
+			}
+		}()
+	}
+	wg.Wait()
+	if got := maxInFlight.Load(); got > 1 {
+		t.Fatalf("%d requests reached the upstream at once during the outage, want 1", got)
+	}
+}
+
+// A rate limit the credential pool keeps for itself is retried here.
+func TestGenAIStreamRetriesARateLimitUntilItLifts(t *testing.T) {
+	fastGenAIHold(t, time.Hour)
+	executor := &scriptedGeminiExecutor{id: "genai-hold-rate-limit", script: func(n int) (*coreexecutor.StreamResult, error) {
+		if n == 1 {
+			return nil, genaiTestError{status: http.StatusTooManyRequests, msg: "rate limited"}
+		}
+		return streamOf(coreexecutor.StreamChunk{Payload: []byte(genaiTestChunk)}), nil
+	}}
+	router, model := newGenAITestRouter(t, executor, false)
+
 	recorder := serveGenAI(router, model, genaiUserAgent)
 
-	if recorder.Code != http.StatusOK || !strings.HasPrefix(recorder.Body.String(), "data: ") {
-		t.Fatalf("status = %d body = %q, want the answer after the cooldown", recorder.Code, recorder.Body.String())
+	if recorder.Code != http.StatusOK || recorder.Body.String() != "data: "+genaiTestChunk+"\n\n" {
+		t.Fatalf("status = %d body = %q, want the answer", recorder.Code, recorder.Body.String())
 	}
 	if got := executor.Calls(); got != 2 {
-		t.Fatalf("upstream calls = %d, want 2: retries during the cooldown must not reach the upstream", got)
+		t.Fatalf("upstream calls = %d, want 2", got)
 	}
 }
 
@@ -194,20 +280,23 @@ func TestGenAIStreamReturnsAPermanentErrorAtOnce(t *testing.T) {
 	}
 }
 
-func TestGenAIStreamReportsAPermanentErrorAfterHoldingAsABareErrorLine(t *testing.T) {
-	fastGenAIHold(t, time.Hour)
-	executor := &scriptedGeminiExecutor{id: "genai-hold-late-permanent", script: func(n int) (*coreexecutor.StreamResult, error) {
-		if n == 1 {
-			return nil, genaiTestError{status: http.StatusServiceUnavailable, msg: "unavailable"}
-		}
+func TestGenAIStreamReportsAPermanentErrorAfterTheHeadersAsABareErrorLine(t *testing.T) {
+	fastGenAIHold(t, time.Millisecond)
+	release := make(chan struct{})
+	executor := &scriptedGeminiExecutor{id: "genai-hold-late-permanent", script: func(int) (*coreexecutor.StreamResult, error) {
+		<-release
 		return nil, genaiTestError{status: http.StatusBadRequest, msg: "request contains an invalid argument"}
 	}}
 	router, model := newGenAITestRouter(t, executor, false)
+	go func() {
+		time.Sleep(50 * time.Millisecond)
+		close(release)
+	}()
 
 	recorder := serveGenAI(router, model, genaiUserAgent)
 
 	if recorder.Code != http.StatusOK {
-		t.Fatalf("status = %d, want 200 once the hold sent headers; body=%q", recorder.Code, recorder.Body.String())
+		t.Fatalf("status = %d, want 200 once headers went out; body=%q", recorder.Code, recorder.Body.String())
 	}
 	body := recorder.Body.String()
 	if !strings.HasPrefix(body, `{"error":{"code":400,`) || !strings.Contains(body, `"status":"INVALID_ARGUMENT"`) || !strings.HasSuffix(body, "}\n\n") {
@@ -215,29 +304,77 @@ func TestGenAIStreamReportsAPermanentErrorAfterHoldingAsABareErrorLine(t *testin
 	}
 }
 
-func TestGenAIStreamReportsAMidStreamFailureAsARetryableErrorLine(t *testing.T) {
+// An answer that breaks off is continued from what the client already has,
+// in the same stream.
+func TestGenAIStreamContinuesAnAnswerThatBrokeOff(t *testing.T) {
 	fastGenAIHold(t, time.Hour)
-	executor := &scriptedGeminiExecutor{id: "genai-hold-midstream", script: func(int) (*coreexecutor.StreamResult, error) {
-		return streamOf(
-			coreexecutor.StreamChunk{Payload: []byte(genaiTestChunk)},
-			coreexecutor.StreamChunk{Err: errors.New("unexpected EOF")},
-		), nil
+	first, second := textChunk("Hello, wor"), textChunk("ld!")
+	executor := &scriptedGeminiExecutor{id: "genai-hold-continue", script: func(n int) (*coreexecutor.StreamResult, error) {
+		if n == 1 {
+			return streamOf(coreexecutor.StreamChunk{Payload: first}, coreexecutor.StreamChunk{Err: io.ErrUnexpectedEOF}), nil
+		}
+		return streamOf(coreexecutor.StreamChunk{Payload: second}), nil
 	}}
-	router, model := newGenAITestRouter(t, executor, false)
+	router, model := newGenAITestRouter(t, executor, true)
 
 	recorder := serveGenAI(router, model, genaiUserAgent)
 
-	body := recorder.Body.String()
-	want := "data: " + genaiTestChunk + "\n\n" + `{"error":{"code":503,"message":"unexpected EOF","status":"UNAVAILABLE"}}` + "\n\n"
-	if body != want {
-		t.Fatalf("body = %q, want %q", body, want)
+	if want := sse(first, second); recorder.Body.String() != want {
+		t.Fatalf("body = %q, want the answer joined: %q", recorder.Body.String(), want)
+	}
+	if got := executor.Calls(); got != 2 {
+		t.Fatalf("upstream calls = %d, want 2", got)
+	}
+	continuation := executor.Payload(2)
+	if got := ojson.GetBytes(continuation, "contents.#").Int(); got != 3 {
+		t.Fatalf("continuation has %d contents, want the request, the partial answer and the instruction: %s", got, continuation)
+	}
+	if role, text := ojson.GetBytes(continuation, "contents.1.role").String(), ojson.GetBytes(continuation, "contents.1.parts.0.text").String(); role != "model" || text != "Hello, wor" {
+		t.Fatalf("second content has role %q text %q, want the model's partial answer", role, text)
+	}
+	if role, text := ojson.GetBytes(continuation, "contents.2.role").String(), ojson.GetBytes(continuation, "contents.2.parts.0.text").String(); role != "user" || text != genaiContinueInstruction {
+		t.Fatalf("continuation ends with role %q text %q, want the instruction to continue", role, text)
+	}
+}
+
+// Thoughts are not part of the answer the continuation starts from.
+func TestGenAIAnswerKeepsTextAndToolCallsOnly(t *testing.T) {
+	var answer genaiAnswer
+	answer.add([]byte(`{"candidates":[{"content":{"role":"model","parts":[{"text":"planning","thought":true},{"text":"Hi "}]}}]}`))
+	answer.add([]byte(`{"candidates":[{"content":{"role":"model","parts":[{"text":"there"}]}}]}`))
+	if answer.text.String() != "Hi there" || answer.toolCall {
+		t.Fatalf("text = %q toolCall = %v, want %q and no tool call", answer.text.String(), answer.toolCall, "Hi there")
+	}
+	answer.add([]byte(`{"candidates":[{"content":{"role":"model","parts":[{"functionCall":{"name":"read_file","args":{}}}]}}]}`))
+	if !answer.toolCall {
+		t.Fatal("a function call part was not seen")
+	}
+}
+
+// An answer that already holds a tool call ends where it broke off: the
+// client runs the tool and goes on.
+func TestGenAIStreamEndsAnAnswerWithAToolCallWhereItBrokeOff(t *testing.T) {
+	fastGenAIHold(t, time.Hour)
+	call := []byte(`{"candidates":[{"content":{"role":"model","parts":[{"functionCall":{"name":"read_file","args":{"Path":"/tmp/x"}}}]},"index":0}]}`)
+	executor := &scriptedGeminiExecutor{id: "genai-hold-tool-call", script: func(int) (*coreexecutor.StreamResult, error) {
+		return streamOf(coreexecutor.StreamChunk{Payload: call}, coreexecutor.StreamChunk{Err: io.ErrUnexpectedEOF}), nil
+	}}
+	router, model := newGenAITestRouter(t, executor, true)
+
+	recorder := serveGenAI(router, model, genaiUserAgent)
+
+	if want := sse(call) + string(genaiStopChunk); recorder.Body.String() != want {
+		t.Fatalf("body = %q, want %q", recorder.Body.String(), want)
+	}
+	if got := executor.Calls(); got != 1 {
+		t.Fatalf("upstream calls = %d, want 1", got)
 	}
 }
 
 func TestGenAIStreamLeavesOtherClientsAlone(t *testing.T) {
 	fastGenAIHold(t, time.Hour)
 	executor := &scriptedGeminiExecutor{id: "genai-hold-other-client", script: func(int) (*coreexecutor.StreamResult, error) {
-		return nil, genaiTestError{status: http.StatusServiceUnavailable, msg: "unavailable"}
+		return nil, capacityError
 	}}
 	router, model := newGenAITestRouter(t, executor, false)
 
@@ -267,7 +404,7 @@ func TestGenAIStreamSendsHeadersBeforeTheClientsHeaderTimeout(t *testing.T) {
 	defer server.Close()
 
 	client := &http.Client{Transport: &http.Transport{ResponseHeaderTimeout: 2 * time.Second}}
-	request, _ := http.NewRequest(http.MethodPost, server.URL+"/v1beta/models/"+model+":streamGenerateContent?alt=sse", strings.NewReader(`{"contents":[{"parts":[{"text":"hi"}]}]}`))
+	request, _ := http.NewRequest(http.MethodPost, server.URL+"/v1beta/models/"+model+":streamGenerateContent?alt=sse", strings.NewReader(genaiTestRequest))
 	request.Header.Set("User-Agent", genaiUserAgent)
 	response, errDo := client.Do(request)
 	if errDo != nil {
@@ -290,23 +427,48 @@ func TestGenAIStreamSendsHeadersBeforeTheClientsHeaderTimeout(t *testing.T) {
 // A process that handed its work to a newer one must end a held stream with a
 // retryable error, so the client's retry reaches the new process.
 func TestGenAIStreamEndsAHeldStreamAfterAHandoff(t *testing.T) {
-	fastGenAIHold(t, time.Hour)
+	fastGenAIHold(t, time.Millisecond)
 	t.Cleanup(handoff.Unfreeze)
 	executor := &scriptedGeminiExecutor{id: "genai-hold-handoff", script: func(n int) (*coreexecutor.StreamResult, error) {
+		if n == 1 {
+			time.Sleep(20 * time.Millisecond) // headers go out meanwhile
+		}
 		if n == 2 {
 			handoff.Freeze(nil)
 		}
-		return nil, genaiTestError{status: http.StatusServiceUnavailable, msg: "No capacity available for model on the server"}
+		return nil, capacityError
 	}}
 	router, model := newGenAITestRouter(t, executor, false)
 
 	recorder := serveGenAI(router, model, genaiUserAgent)
 
-	want := `{"error":{"code":503,"message":"No capacity available for model on the server","status":"UNAVAILABLE"}}` + "\n\n"
-	if recorder.Code != http.StatusOK || recorder.Body.String() != want {
-		t.Fatalf("status = %d body = %q, want 200 and %q", recorder.Code, recorder.Body.String(), want)
+	body := recorder.Body.String()
+	if recorder.Code != http.StatusOK || !strings.HasPrefix(body, `{"error":{"code":503,`) || !strings.Contains(body, `"status":"UNAVAILABLE"`) {
+		t.Fatalf("status = %d body = %q, want 200 and one retryable error line", recorder.Code, body)
 	}
 	if got := executor.Calls(); got != 2 {
 		t.Fatalf("upstream calls = %d, want 2", got)
+	}
+}
+
+// A continuation the upstream refuses ends with a retryable error, so the
+// client retries the whole call instead of ending its turn.
+func TestGenAIStreamRefusedContinuationIsRetryable(t *testing.T) {
+	fastGenAIHold(t, time.Hour)
+	first := textChunk("Hello, wor")
+	executor := &scriptedGeminiExecutor{id: "genai-hold-refused-continuation", script: func(n int) (*coreexecutor.StreamResult, error) {
+		if n == 1 {
+			return streamOf(coreexecutor.StreamChunk{Payload: first}, coreexecutor.StreamChunk{Err: io.ErrUnexpectedEOF}), nil
+		}
+		return nil, genaiTestError{status: http.StatusBadRequest, msg: "request contains an invalid argument"}
+	}}
+	router, model := newGenAITestRouter(t, executor, true)
+
+	recorder := serveGenAI(router, model, genaiUserAgent)
+
+	body := recorder.Body.String()
+	rest, ok := strings.CutPrefix(body, sse(first))
+	if !ok || !strings.HasPrefix(rest, `{"error":{"code":503,`) || !strings.Contains(rest, `"status":"UNAVAILABLE"`) {
+		t.Fatalf("body = %q, want the partial answer and one retryable error line", body)
 	}
 }

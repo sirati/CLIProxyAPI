@@ -379,11 +379,8 @@ func (h *GeminiAPIHandler) handleGenerateContent(c *gin.Context, modelName strin
 }
 
 func (h *GeminiAPIHandler) forwardGeminiStream(c *gin.Context, flusher http.Flusher, alt string, cancel func(error), data <-chan []byte, errs <-chan *interfaces.ErrorMessage) {
-	// A genai SDK client fails the turn on an SSE comment, so it gets no
-	// comment keep-alives.
-	genai := alt == "" && isGenAIClient(c)
 	var keepAliveInterval *time.Duration
-	if alt != "" || genai {
+	if alt != "" {
 		keepAliveInterval = new(time.Duration(0))
 	}
 
@@ -403,10 +400,6 @@ func (h *GeminiAPIHandler) forwardGeminiStream(c *gin.Context, flusher http.Flus
 				return
 			}
 			h.LoggingAPIResponseError(c, errMsg)
-			if genai {
-				_, _ = c.Writer.Write(genaiErrorLine(errMsg))
-				return
-			}
 			status := http.StatusInternalServerError
 			if errMsg.StatusCode > 0 {
 				status = errMsg.StatusCode
