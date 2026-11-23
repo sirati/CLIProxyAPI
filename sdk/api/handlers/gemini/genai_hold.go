@@ -33,10 +33,10 @@ import (
 //     credential cooling down, are retried here.
 //   - When the upstream breaks off mid-answer, the client keeps what it has
 //     received and the proxy asks the upstream to continue from there: the
-//     request goes out again with that text as the start of the model's turn,
-//     and the continuation joins the same stream. An answer that already
-//     holds a tool call ends there instead, since the client must run the
-//     tool before anything can continue.
+//     request goes out again with that text as the model's turn and an
+//     instruction to continue it, and the continuation joins the same
+//     stream. An answer that already holds a tool call ends there instead,
+//     since the client must run the tool before anything can continue.
 //
 // Two client limits shape this. The client gives up when response headers
 // take longer than 60 seconds, so a held or slow stream sends its headers
@@ -208,11 +208,35 @@ func (a *genaiAnswer) add(chunk []byte) {
 	}
 }
 
+// genaiFinishReason is the finish reason among chunks, if any.
+func genaiFinishReason(chunks [][]byte) string {
+	for _, chunk := range chunks {
+		if reason := ojson.GetBytes(chunk, "candidates.0.finishReason").String(); reason != "" {
+			return reason
+		}
+	}
+	return ""
+}
+
+// genaiHasAnswer reports whether chunk carries visible text or a tool call,
+// not only thoughts or an empty part.
+func genaiHasAnswer(chunk []byte) bool {
+	for _, part := range ojson.GetBytes(chunk, "candidates.0.content.parts").Array() {
+		if part.Get("functionCall").Exists() || (!part.Get("thought").Bool() && part.Get("text").String() != "") {
+			return true
+		}
+	}
+	return false
+}
+
 // genaiContinueInstruction follows the partial answer in a continuation:
 // Antigravity refuses a request that ends with a model turn ("Requests ending
 // with a model turn are not supported"), so the answer cannot simply be
-// prefilled.
-const genaiContinueInstruction = "Your previous reply was cut off by a network error. Continue it exactly where it stopped, character for character: do not repeat anything already written and add nothing before the continuation."
+// prefilled. Gemini 4 Neon, Claude Opus 5.5 and Sonnet 5.5 on Antigravity
+// all continue character for character with this wording; Opus answered a
+// wording that mentioned a network error and asked for its reply to be
+// "joined directly" with finish reason SAFETY and no text.
+const genaiContinueInstruction = "Please continue from exactly where your last message stopped, mid-word if needed, without repeating any of it."
 
 // genaiContinuation is the request that continues an answer from its text:
 // the original request, the text as the model's turn, and an instruction to
@@ -292,9 +316,12 @@ func (h *GeminiAPIHandler) handleGenAIStream(c *gin.Context, flusher http.Flushe
 			}
 		}
 
-		// Relay this attempt until it ends or fails.
+		// Relay this attempt until it ends or fails. A continuation is held
+		// back until it carries text or a tool call: one that ends without,
+		// such as a refusal, must not end the client's turn.
 		var errMsg *interfaces.ErrorMessage
 		delivered := false
+		var held [][]byte
 		for errMsg == nil && (run.data != nil || run.errs != nil) {
 			select {
 			case <-clientGone:
@@ -313,16 +340,36 @@ func (h *GeminiAPIHandler) handleGenAIStream(c *gin.Context, flusher http.Flushe
 						errMsg = pending
 						continue
 					}
+					if continuing && !delivered {
+						logger.Infof("gemini: the continuation of %s for a genai client ended without text (finish reason %q); the client retries the call", modelName, genaiFinishReason(held))
+						refused := &interfaces.ErrorMessage{StatusCode: http.StatusServiceUnavailable, Error: errors.New("the upstream broke off the answer and did not continue it")}
+						h.LoggingAPIResponseError(c, refused)
+						_, _ = c.Writer.Write(genaiErrorLine(refused))
+						flusher.Flush()
+						cliCancel(refused.Error)
+						return
+					}
 					commit(run.headers)
 					cliCancel(nil)
 					return
 				}
+				if continuing && !delivered {
+					held = append(held, chunk)
+					if !genaiHasAnswer(chunk) {
+						continue
+					}
+				} else {
+					held = [][]byte{chunk}
+				}
 				commit(run.headers)
-				_, _ = c.Writer.Write([]byte("data: "))
-				_, _ = c.Writer.Write(chunk)
-				_, _ = c.Writer.Write([]byte("\n\n"))
+				for _, part := range held {
+					_, _ = c.Writer.Write([]byte("data: "))
+					_, _ = c.Writer.Write(part)
+					_, _ = c.Writer.Write([]byte("\n\n"))
+					answer.add(part)
+				}
+				held = nil
 				flusher.Flush()
-				answer.add(chunk)
 				if !delivered && !heldSince.IsZero() {
 					logger.Infof("gemini: %s answers a genai client again after %d retries (held %s)", modelName, failures, time.Since(heldSince).Round(time.Second))
 					heldSince = time.Time{}

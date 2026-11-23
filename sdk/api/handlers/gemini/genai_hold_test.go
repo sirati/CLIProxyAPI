@@ -472,3 +472,50 @@ func TestGenAIStreamRefusedContinuationIsRetryable(t *testing.T) {
 		t.Fatalf("body = %q, want the partial answer and one retryable error line", body)
 	}
 }
+
+// A continuation that ends without text, such as a refusal, must not reach
+// the client: its finish reason would end the turn. The client retries the
+// whole call instead.
+func TestGenAIStreamHoldsBackAContinuationWithoutText(t *testing.T) {
+	fastGenAIHold(t, time.Hour)
+	first := textChunk("Hello, wor")
+	empty := []byte(`{"candidates":[{"content":{"role":"model","parts":[{"text":""}]}}]}`)
+	safety := []byte(`{"candidates":[{"content":{"role":"model","parts":[{"text":""}]},"finishReason":"SAFETY"}]}`)
+	executor := &scriptedGeminiExecutor{id: "genai-hold-empty-continuation", script: func(n int) (*coreexecutor.StreamResult, error) {
+		if n == 1 {
+			return streamOf(coreexecutor.StreamChunk{Payload: first}, coreexecutor.StreamChunk{Err: io.ErrUnexpectedEOF}), nil
+		}
+		return streamOf(coreexecutor.StreamChunk{Payload: empty}, coreexecutor.StreamChunk{Payload: safety}), nil
+	}}
+	router, model := newGenAITestRouter(t, executor, true)
+
+	recorder := serveGenAI(router, model, genaiUserAgent)
+
+	body := recorder.Body.String()
+	rest, ok := strings.CutPrefix(body, sse(first))
+	if !ok || strings.Contains(rest, "SAFETY") || !strings.HasPrefix(rest, `{"error":{"code":503,`) {
+		t.Fatalf("body = %q, want the partial answer and one retryable error line", body)
+	}
+}
+
+// Thoughts a continuation starts with reach the client in order once its
+// text arrives.
+func TestGenAIStreamReleasesAContinuationsThoughtsWithItsText(t *testing.T) {
+	fastGenAIHold(t, time.Hour)
+	first := textChunk("Hello, wor")
+	thought := []byte(`{"candidates":[{"content":{"role":"model","parts":[{"text":"resuming","thought":true}]}}]}`)
+	rest := textChunk("ld!")
+	executor := &scriptedGeminiExecutor{id: "genai-hold-continuation-thoughts", script: func(n int) (*coreexecutor.StreamResult, error) {
+		if n == 1 {
+			return streamOf(coreexecutor.StreamChunk{Payload: first}, coreexecutor.StreamChunk{Err: io.ErrUnexpectedEOF}), nil
+		}
+		return streamOf(coreexecutor.StreamChunk{Payload: thought}, coreexecutor.StreamChunk{Payload: rest}), nil
+	}}
+	router, model := newGenAITestRouter(t, executor, true)
+
+	recorder := serveGenAI(router, model, genaiUserAgent)
+
+	if want := sse(first, thought, rest); recorder.Body.String() != want {
+		t.Fatalf("body = %q, want %q", recorder.Body.String(), want)
+	}
+}
