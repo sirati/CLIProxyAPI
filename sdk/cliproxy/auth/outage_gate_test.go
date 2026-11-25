@@ -8,6 +8,8 @@ import (
 	"net/url"
 	"testing"
 	"time"
+
+	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/executor"
 )
 
 type outageTestError struct {
@@ -168,5 +170,33 @@ func TestOutageBackoffsLeavesOutAGateThatHoldsNothingBack(t *testing.T) {
 	}
 	if views := m.OutageBackoffs(now.Add(2 * time.Second)); len(views) != 0 {
 		t.Fatalf("views = %+v, want none once nobody waits and no try is due", views)
+	}
+}
+
+// A held request to a Codex account waits out overloads at the outage gate
+// and still goes through the account's 429 pacer.
+func TestPacedHoldsACodexRequestThroughOverloads(t *testing.T) {
+	restore := SetOutageGateTimingForTest(time.Millisecond, 4*time.Millisecond)
+	defer restore()
+	m := NewManager(nil, nil, nil)
+	auth := &Auth{ID: "paced-codex-auth", Provider: "codex", Status: StatusActive}
+	opts := cliproxyexecutor.Options{Metadata: map[string]any{cliproxyexecutor.RequestedModelMetadataKey: "gpt-6.1-sol"}}
+	calls := 0
+	dispatch := func(context.Context) (string, error) {
+		calls++
+		if calls <= 3 {
+			return "", outageTestError{http.StatusServiceUnavailable, `{"error":{"type":"service_unavailable_error","code":"server_is_overloaded","message":"Our servers are currently overloaded. Please try again later."}}`}
+		}
+		return "answer", nil
+	}
+
+	out, err := paced(m, WithOutageHold(context.Background()), auth, opts, dispatch)
+	if err != nil || out != "answer" || calls != 4 {
+		t.Fatalf("out = %q err = %v after %d calls, want the answer after 4", out, err, calls)
+	}
+
+	calls = 0
+	if _, err := paced(m, context.Background(), auth, opts, dispatch); err == nil || calls != 1 {
+		t.Fatalf("an unheld request: err = %v after %d calls, want the overload after 1", err, calls)
 	}
 }

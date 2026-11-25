@@ -310,12 +310,20 @@ func sleepCtx(ctx context.Context, d time.Duration) error {
 	}
 }
 
-// paced runs dispatch for a Codex account at the account's pace.
+// paced runs dispatch for a request held through outages at the gate of its
+// credential and model, and for a Codex account at the account's pace.
 func paced[T any](m *Manager, ctx context.Context, auth *Auth, opts cliproxyexecutor.Options, dispatch func(context.Context) (T, error)) (T, error) {
-	var zero T
-	if m != nil && auth != nil && auth.Provider != "codex" && holdsThroughOutages(ctx) {
-		return throughOutages(m, ctx, auth, opts, dispatch)
+	if m != nil && auth != nil && holdsThroughOutages(ctx) {
+		return throughOutages(m, ctx, auth, opts, func(ctx context.Context) (T, error) {
+			return pacedCodex(m, ctx, auth, opts, dispatch)
+		})
 	}
+	return pacedCodex(m, ctx, auth, opts, dispatch)
+}
+
+// pacedCodex runs dispatch for a Codex account at the account's pace.
+func pacedCodex[T any](m *Manager, ctx context.Context, auth *Auth, opts cliproxyexecutor.Options, dispatch func(context.Context) (T, error)) (T, error) {
+	var zero T
 	if m == nil || auth == nil || auth.Provider != "codex" {
 		return dispatch(ctx)
 	}

@@ -16,12 +16,14 @@ import (
 	log "github.com/sirupsen/logrus"
 )
 
-// An overloaded model answers 503 "No capacity available"
-// (MODEL_CAPACITY_EXHAUSTED) or another server error, sometimes for half an
-// hour. A client that cannot wait that out itself, such as the Antigravity
-// CLI, marks its requests with WithOutageHold. Such a request is never failed
-// for an outage: it waits in the proxy and is sent again on the credential it
-// was routed to, until the upstream answers.
+// An overloaded model answers with a server error, sometimes for half an
+// hour: Antigravity with 503 "No capacity available"
+// (MODEL_CAPACITY_EXHAUSTED), OpenAI with "Our servers are currently
+// overloaded" (server_is_overloaded). A client that cannot wait that out
+// itself, such as the Antigravity CLI or Codex under T3 Code, marks its
+// requests with WithOutageHold. Such a request is never failed for an outage:
+// it waits in the proxy and is sent again on the credential it was routed to,
+// until the upstream answers.
 //
 // Each credential and model has one gate. While it is open every request goes
 // straight through. The first outage error closes it for a second; from then
@@ -45,10 +47,17 @@ func WithOutageHold(ctx context.Context) context.Context {
 	return context.WithValue(ctx, outageHoldKey{}, true)
 }
 
-func holdsThroughOutages(ctx context.Context) bool {
+// HoldsThroughOutages reports whether ctx belongs to a request marked with
+// WithOutageHold.
+func HoldsThroughOutages(ctx context.Context) bool {
+	if ctx == nil {
+		return false
+	}
 	held, _ := ctx.Value(outageHoldKey{}).(bool)
 	return held
 }
+
+func holdsThroughOutages(ctx context.Context) bool { return HoldsThroughOutages(ctx) }
 
 type outageGate struct {
 	interval time.Duration // 0: open

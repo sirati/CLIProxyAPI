@@ -28,6 +28,7 @@ import (
 	translatorcommon "github.com/router-for-me/CLIProxyAPI/v8/internal/translator/common"
 	sdkaccess "github.com/router-for-me/CLIProxyAPI/v8/sdk/access"
 	"github.com/router-for-me/CLIProxyAPI/v8/sdk/api/handlers"
+	coreauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
 	"github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/usage"
 )
 
@@ -1121,6 +1122,13 @@ func (h *OpenAIResponsesAPIHandler) handleStreamingResponse(c *gin.Context, rawJ
 	deliveryCtx, finishDelivery := usage.WithStreamDelivery(context.Background())
 	defer finishDelivery(context.Canceled)
 	cliCtx, cancelExecution := h.GetContextWithCancel(h, c, deliveryCtx)
+	// Codex waits for a response as long as it takes, but a turn it retries
+	// for ten minutes is ended by T3 Code. So an overloaded upstream is waited
+	// out in the proxy, one try at a time per credential and model, and Codex
+	// sees a slow start instead of the failure.
+	if isCodexResponsesClientRequest(c) {
+		cliCtx = coreauth.WithOutageHold(cliCtx)
+	}
 	cliCancel := func(err error) {
 		finishDelivery(err)
 		cancelExecution(err)
@@ -1322,6 +1330,14 @@ func isCodexResponsesClientRequest(c *gin.Context) bool {
 	}
 	if multiagentv2.IsCodexClientUserAgent(c.GetHeader("User-Agent")) {
 		return true
+	}
+	// An app embedding Codex names itself in the user agent and originator,
+	// such as T3 Code's "T3 Code/0.171.0", but Codex still sends its own
+	// headers with every request.
+	for _, header := range []string{"X-Codex-Installation-Id", "X-Codex-Window-Id", "X-Codex-Turn-Metadata"} {
+		if strings.TrimSpace(c.GetHeader(header)) != "" {
+			return true
+		}
 	}
 
 	switch originator := strings.ToLower(strings.TrimSpace(c.GetHeader("Originator"))); originator {

@@ -170,10 +170,13 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 
 	httpClient := helps.NewUtlsHTTPClient(ctx, e.cfg, auth, 0)
 	httpClient = reporter.TrackHTTPClientRoundTripOnly(httpClient)
-	buffering := e.cfg != nil && e.cfg.Codex.StreamBootstrapBuffering
+	// A request held through outages always buffers its start, so an overload
+	// before any output fails the attempt and is waited out instead of
+	// reaching the client as a broken stream.
+	buffering := (e.cfg != nil && e.cfg.Codex.StreamBootstrapBuffering) || cliproxyauth.HoldsThroughOutages(ctx)
 	var bootstrapTimeout time.Duration
 	var bootstrapStart time.Time
-	if buffering {
+	if buffering && e.cfg != nil {
 		bootstrapTimeout = e.cfg.Codex.StreamBootstrapTimeoutDuration()
 	}
 	// Start the bootstrap clock at response headers, before decoding may read body bytes.

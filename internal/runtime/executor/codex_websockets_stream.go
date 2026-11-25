@@ -322,11 +322,14 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 		return e.streamCodexDuplex(ctx, auth, req, opts, sess, conn, readCh, input, prepared, reporter, upstreamHeaders, unlockStreamSession), nil
 	}
 
-	buffering := e.cfg != nil && e.cfg.Codex.StreamBootstrapBuffering
+	// A request held through outages always buffers its start, so an overload
+	// before any output fails the attempt and is waited out instead of
+	// reaching the client as a broken stream.
+	buffering := (e.cfg != nil && e.cfg.Codex.StreamBootstrapBuffering) || cliproxyauth.HoldsThroughOutages(ctx)
 	var bootstrapTimeout time.Duration
 	var bootstrapStart time.Time
 	var exhaustionLogged bool
-	if buffering {
+	if buffering && e.cfg != nil {
 		bootstrapTimeout = e.cfg.Codex.StreamBootstrapTimeoutDuration()
 		bootstrapStart = nowCodexBootstrap()
 	}
