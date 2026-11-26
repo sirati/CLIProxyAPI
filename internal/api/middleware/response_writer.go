@@ -402,7 +402,7 @@ func (w *ResponseWriterWrapper) Finalize(c *gin.Context) error {
 	}
 
 	hasAPIError := w.panicked || hasActionableError(c, finalStatusCode, slicesAPIResponseError)
-	forceLog := w.logOnErrorOnly && hasAPIError && !w.logger.IsEnabled()
+	forceLog := w.logOnErrorOnly && hasAPIError && !w.logger.IsEnabled() && !c.GetBool(logging.SkipErrorLogContextKey)
 	websocketTimelineSource := w.extractWebsocketTimelineSource(c)
 	apiRequestSource := w.extractAPIRequestSource(c)
 	apiResponseSource := w.extractAPIResponseSource(c)

@@ -87,6 +87,13 @@ type SDKConfig struct {
 	// credentials as well.
 	ForceModelPrefix bool `yaml:"force-model-prefix" json:"force-model-prefix"`
 
+	// KnownMissingModels lists model names that no provider serves but that clients
+	// keep asking for. Such a request is refused as usual (400 model_not_found) but
+	// leaves no error log, so it does not push real failures out of the error-log
+	// rotation. A model a provider does serve is unaffected. Names match the base
+	// model name exactly, ignoring case.
+	KnownMissingModels []string `yaml:"known-missing-models,omitempty" json:"known-missing-models,omitempty"`
+
 	// RequestLog enables or disables detailed request logging functionality.
 	RequestLog bool `yaml:"request-log" json:"request-log"`
 

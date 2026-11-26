@@ -10,6 +10,7 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/clienterror"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/interfaces"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/logging"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
 	"golang.org/x/net/context"
 )
@@ -118,6 +119,9 @@ func (h *BaseAPIHandler) WriteErrorResponse(c *gin.Context, msg *interfaces.Erro
 	status := http.StatusInternalServerError
 	if msg != nil && msg.StatusCode > 0 {
 		status = msg.StatusCode
+	}
+	if msg != nil && msg.SkipErrorLog && c != nil {
+		c.Set(logging.SkipErrorLogContextKey, true)
 	}
 	if msg != nil && msg.DirectResponse {
 		h.writeDirectErrorResponse(c, status, msg)
@@ -237,6 +241,9 @@ func (h *BaseAPIHandler) LoggingAPIResponseError(ctx context.Context, err *inter
 		ginContext, ok = ctx.Value("gin").(*gin.Context)
 	}
 	if ok && ginContext != nil {
+		if err.SkipErrorLog {
+			ginContext.Set(logging.SkipErrorLogContextKey, true)
+		}
 		if apiResponseErrors, isExist := ginContext.Get("API_RESPONSE_ERROR"); isExist {
 			if slicesAPIResponseError, isOk := apiResponseErrors.([]*interfaces.ErrorMessage); isOk {
 				slicesAPIResponseError = append(slicesAPIResponseError, err)

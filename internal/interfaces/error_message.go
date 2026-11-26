@@ -26,4 +26,8 @@ type ErrorMessage struct {
 
 	// Headers contains downstream response headers when DirectResponse is true.
 	Headers http.Header
+
+	// SkipErrorLog marks an expected refusal, such as a request for a model in
+	// routing.known-missing-models: it is answered as usual but writes no error log.
+	SkipErrorLog bool
 }

@@ -265,14 +265,27 @@ func (h *BaseAPIHandler) getRequestDetailsWithOptions(modelName string, allowIma
 			body = `{"error":{"message":"unknown provider for model","type":"invalid_request_error","code":"model_not_found","param":"model"}}`
 		}
 		return nil, "", &interfaces.ErrorMessage{
-			StatusCode: http.StatusBadRequest,
-			Error:      errors.New(body),
+			StatusCode:   http.StatusBadRequest,
+			Error:        errors.New(body),
+			SkipErrorLog: h.isKnownMissingModel(baseModel) || h.isKnownMissingModel(modelName),
 		}
 	}
 
 	// The thinking suffix is preserved in the model name itself, so no
 	// metadata-based configuration passing is needed.
 	return providers, resolvedModelName, nil
+}
+
+// isKnownMissingModel reports whether model is listed in routing.known-missing-models.
+func (h *BaseAPIHandler) isKnownMissingModel(model string) bool {
+	cfg := h.CurrentConfig()
+	if cfg == nil {
+		return false
+	}
+	model = strings.TrimSpace(model)
+	return model != "" && slices.ContainsFunc(cfg.KnownMissingModels, func(known string) bool {
+		return strings.EqualFold(strings.TrimSpace(known), model)
+	})
 }
 
 func (h *BaseAPIHandler) validateImageOnlyModel(modelName string, allowImageModel bool) *interfaces.ErrorMessage {

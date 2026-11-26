@@ -260,6 +260,13 @@ routing:
   # When true, unprefixed model requests only use credentials without a prefix (except when prefix == model name).
   force-model-prefix: false
 
+  # Models no provider serves that clients keep asking for anyway. Requests for them
+  # are still refused (400 model_not_found) but write no error log, so they cannot
+  # push real failures out of the error-log rotation. Exact names, ignoring case;
+  # a model some provider does serve is not affected.
+  # known-missing-models:
+  #   - "gemini-3.8-flash"
+
   retry:
     # Number of additional credential retry rounds after the first round exhausts
     # its eligible credentials. Round 0 is the initial round; round r only admits

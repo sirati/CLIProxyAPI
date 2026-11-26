@@ -103,6 +103,9 @@ func BuildConfigChangeDetails(oldCfg, newCfg *config.Config) []string {
 	if oldCfg.ForceModelPrefix != newCfg.ForceModelPrefix {
 		changes = append(changes, fmt.Sprintf("force-model-prefix: %t -> %t", oldCfg.ForceModelPrefix, newCfg.ForceModelPrefix))
 	}
+	if strings.Join(oldCfg.KnownMissingModels, ",") != strings.Join(newCfg.KnownMissingModels, ",") {
+		changes = append(changes, fmt.Sprintf("known-missing-models: [%s] -> [%s]", strings.Join(oldCfg.KnownMissingModels, ", "), strings.Join(newCfg.KnownMissingModels, ", ")))
+	}
 	if oldCfg.NonStreamKeepAliveInterval != newCfg.NonStreamKeepAliveInterval {
 		changes = append(changes, fmt.Sprintf("nonstream-keepalive-interval: %d -> %d", oldCfg.NonStreamKeepAliveInterval, newCfg.NonStreamKeepAliveInterval))
 	}
